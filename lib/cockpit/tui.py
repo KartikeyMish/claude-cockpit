@@ -15,9 +15,11 @@ import time
 from dataclasses import dataclass, field, replace
 
 from . import VERSION
+from .pricing import context_level, fmt_usd
+from .team import SessionUsage, UsageBook
 from .tiers import COLOURS, load_tiers
 from .core import (
-    DEFAULT_IDLE_HOURS, SESSIONS_DIR, CockpitError, Proc, Session, current_ms, gc_candidates,
+    DEFAULT_IDLE_HOURS, SESSIONS_DIR, CockpitError, Proc, Session, current_ms, duplicate_of, gc_candidates,
     human_duration, human_mb, load_sessions, parse_hours, protected_pids, read_processes,
     short_path, system_memory_kb, terminal_totals_kb, terminate,
 )
@@ -29,7 +31,7 @@ WORKTREE_NAME = re.compile(r"[A-Za-z0-9._/-]")
 BAR_EIGHTHS = " ▏▎▍▌▋▊▉█"
 PULSE = "◐◓◑◒"
 
-KEYS_MAIN = (("⏎", "claude here"), ("w", "worktree"), ("x", "close"), ("g", "clean idle"),
+KEYS_MAIN = (("⏎", "claude here"), ("v", "team"), ("w", "worktree"), ("x", "close"), ("g", "clean idle"),
              ("a", "background"), ("t", "tiers"), ("d", "doctor"), ("q", "quit"))
 
 
@@ -54,10 +56,23 @@ class Snapshot:
     terminals: dict[str, int] = field(default_factory=dict)
     system_kb: int | None = None
     error: str = ""
+    usage: dict[int, SessionUsage] = field(default_factory=dict)   # pid -> context + spend
 
     @property
     def claude_kb(self) -> int:
         return sum(s.tree_rss_kb for s in self.sessions)
+
+    @property
+    def spend_usd(self) -> float:
+        """Each conversation once, even when it is open in two terminals."""
+        dupes = duplicate_of(self.sessions)
+        return sum(u.cost_usd for pid, u in self.usage.items() if pid not in dupes)
+
+    def context_alerts(self) -> list[tuple[Session, SessionUsage]]:
+        """Interactive sessions whose context is filling up, fullest first."""
+        flagged = [(s, self.usage[s.pid]) for s in self.sessions
+                   if not s.is_sdk and s.pid in self.usage and context_level(self.usage[s.pid].pct) != "ok"]
+        return sorted(flagged, key=lambda pair: -pair[1].pct)
 
     def stale(self) -> list[Session]:
         return gc_candidates(self.sessions, self.now, STALE_SECONDS, set(self.protected))
@@ -69,7 +84,8 @@ Action = tuple  # ("launch",) | ("worktree", name) | ("close", pid) | ("gc",) | 
 def visible(snapshot: Snapshot, state: UiState) -> list[Session]:
     """Working sessions first, then most recently used, stale ones sink to the bottom."""
     rows = [s for s in snapshot.sessions if state.show_sdk or not s.is_sdk]
-    return sorted(rows, key=lambda s: (s.status != "busy", s.idle_seconds(snapshot.now) or 0, s.name))
+    return sorted(rows, key=lambda s: (s.status != "waiting", s.status != "busy",
+                                       s.idle_seconds(snapshot.now) or 0, s.name))
 
 
 def clamp(state: UiState, count: int) -> UiState:
@@ -102,6 +118,13 @@ def _key_main(state: UiState, key: str, rows: list[Session], snapshot: Snapshot)
         return replace(quiet, show_tiers=not state.show_tiers), None
     if key == "d":
         return quiet, ("doctor",)
+    if key in {"v", "KEY_RIGHT", "l"}:
+        if not rows:
+            return replace(quiet, message="No session to open.", message_kind="warn"), None
+        target = rows[state.selected]
+        if not target.session_id:
+            return replace(quiet, message="This session has no id yet; try again in a moment.", message_kind="warn"), None
+        return quiet, ("team", target.pid)
     if key in {"q", "\x1b"}:
         return quiet, ("quit",)
     if key == "x":
@@ -173,6 +196,8 @@ def fit(text: str, width: int) -> str:
 
 
 def state_glyph(session: Session, now: int, tick: int) -> tuple[str, str]:
+    if session.status == "waiting":
+        return ("◉" if tick % 2 else "○"), "warn"   # blocked on the user: blink
     if session.status == "busy":
         return PULSE[tick % len(PULSE)], "busy"
     idle = session.idle_seconds(now)
@@ -183,18 +208,23 @@ def state_glyph(session: Session, now: int, tick: int) -> tuple[str, str]:
 
 # ---------------------------------------------------------------- data
 
-def take_snapshot() -> Snapshot:
+def take_snapshot(book: UsageBook | None = None) -> Snapshot:
     try:
         procs: dict[int, Proc] = read_processes()
     except CockpitError as exc:
         return Snapshot(now=current_ms(), error=str(exc))
     now = current_ms()
+    sessions = tuple(load_sessions(SESSIONS_DIR, procs, now))
+    usage: dict[int, SessionUsage] = {}
+    if book is not None:
+        for s in sessions:
+            found = book.usage(s.session_id) if s.session_id else None
+            if found:
+                usage[s.pid] = found
+        book.keep_only({s.session_id for s in sessions if s.session_id})
     return Snapshot(
-        sessions=tuple(load_sessions(SESSIONS_DIR, procs, now)),
-        now=now,
-        protected=frozenset(protected_pids(procs)),
-        terminals=terminal_totals_kb(procs),
-        system_kb=system_memory_kb(),
+        sessions=sessions, now=now, protected=frozenset(protected_pids(procs)),
+        terminals=terminal_totals_kb(procs), system_kb=system_memory_kb(), usage=usage,
     )
 
 
@@ -299,14 +329,33 @@ class View:
             x = self.put(2, x, human_mb(total), curses.A_BOLD)
         for name, kb in sorted(snap.terminals.items(), key=lambda kv: -kv[1]):
             x = self.put(2, x, f"   {name} {human_mb(kb)}", self.attr("dim"))
+        x = self.put(3, 2, "spend      ", self.attr("dim"))
+        x = self.put(3, x, f"≈ {fmt_usd(snap.spend_usd)}", curses.A_BOLD)
+        self.put(3, x, "  API-equivalent, live sessions incl. their agents", self.attr("dim"))
+        y = 4
+        waiting = [s for s in snap.sessions if s.status == "waiting" and not s.is_sdk]
+        if waiting:
+            names = ", ".join(s.name for s in waiting[:3]) + (" …" if len(waiting) > 3 else "")
+            self.put(y, 2, f"◉ {len(waiting)} waiting for you: {names}", self.attr("warn", curses.A_BOLD))
+            y += 1
+        for session, usage in snap.context_alerts()[:2]:
+            critical = context_level(usage.pct) == "critical"
+            advice = "run /compact or start fresh" if critical else "consider /compact soon"
+            self.put(y, 2, f"{'⚠' if critical else '◔'} {session.name} is at {usage.pct:.0f}% context "
+                           f"({usage.context_tokens // 1000}k of {usage.window // 1000}k): {advice}. "
+                           f"Each message now costs ~{fmt_usd(usage.last_turn_usd)}.",
+                     self.attr("error" if critical else "warn", curses.A_BOLD))
+            y += 1
         stale = snap.stale()
         if stale:
             held = human_mb(sum(s.tree_rss_kb for s in stale))
-            self.put(3, 2, f"⚑ {len(stale)} sessions idle ≥ {DEFAULT_IDLE_HOURS}h hold {held}. Press g to reclaim.",
+            self.put(y, 2, f"⚑ {len(stale)} sessions idle ≥ {DEFAULT_IDLE_HOURS}h hold {held}. Press g to reclaim.",
                      self.attr("stale"))
+            y += 1
         if snap.error:
-            self.put(3, 2, f"✗ {snap.error}", self.attr("error"))
-        return 4
+            self.put(y, 2, f"✗ {snap.error}", self.attr("error"))
+            y += 1
+        return y
 
     def _sessions(self, y: int, snap: Snapshot, state: UiState, rows: list[Session],
                   tick: int, height: int, width: int) -> int:
@@ -314,37 +363,47 @@ class View:
         title = f"SESSIONS {len(rows)}" + (f"   +{hidden} background (a)" if hidden else "")
         self.put(y, 2, title, self.attr("accent", curses.A_BOLD))
         y += 1
-        name_w = max(16, min(30, width - 64))
-        dir_w = max(10, width - name_w - 50)
-        header = f"   {'NAME':<{name_w}} {'DIR':<{dir_w}} {'STATE':<6} {'IDLE':>7} {'RAM':>8}  "
+        name_w = max(16, min(28, width - 84))
+        dir_w = max(8, width - name_w - 73)
+        header = (f"   {'NAME':<{name_w}} {'DIR':<{dir_w}} {'STATE':<7} {'IDLE':>7} {'RAM':>8}  "
+                  f"{'CONTEXT':<11} {'COST':>8}")
         self.put(y, 2, header, self.attr("dim"))
         y += 1
         budget = height - y - (11 if state.show_tiers else 3)
         if not rows:
             self.put(y, 4, "No Claude sessions running. Press ⏎ to start one here.", self.attr("dim"))
             return y + 1
-        biggest = max(s.tree_rss_kb for s in rows) or 1
         start = max(0, state.selected - max(1, budget) + 1)
         for index, session in enumerate(rows[start:start + max(1, budget)], start=start):
-            self._session_row(y, session, snap, index == state.selected, tick, name_w, dir_w, biggest)
+            self._session_row(y, session, snap, index == state.selected, tick, name_w, dir_w)
             y += 1
         return y
 
     def _session_row(self, y: int, s: Session, snap: Snapshot, selected: bool, tick: int,
-                     name_w: int, dir_w: int, biggest: int) -> None:
+                     name_w: int, dir_w: int) -> None:
         glyph, tone = state_glyph(s, snap.now, tick)
         sel = curses.A_REVERSE if selected else 0
         marker = "▸" if selected else " "
         x = self.put(y, 1, f" {marker} ", self.attr("accent", curses.A_BOLD))
         x = self.put(y, x, glyph + " ", self.attr(tone, curses.A_BOLD))
-        you = "  ◀ you" if s.pid in snap.protected else ""
+        dupes = duplicate_of(snap.sessions)
+        you = "  ◀ you" if s.pid in snap.protected else (f"  ⧉ same chat as {dupes[s.pid]}" if s.pid in dupes else "")
         name = fit(s.name + (" [bg]" if s.is_sdk else ""), name_w - 2)
         x = self.put(y, x, f"{name:<{name_w - 2}} ", sel | (curses.A_BOLD if selected else 0))
         x = self.put(y, x, f"{fit(short_path(s.cwd), dir_w):<{dir_w}} ", self.attr("dim") | sel)
-        x = self.put(y, x, f"{(s.status or '?'):<6} ", self.attr(tone) | sel)
+        x = self.put(y, x, f"{(s.status or '?'):<7} ", self.attr(tone) | sel)
         x = self.put(y, x, f"{human_duration(s.idle_seconds(snap.now)):>7} ", self.attr(tone) | sel)
-        x = self.put(y, x, f"{human_mb(s.tree_rss_kb):>8} ", sel)
-        x = self.put(y, x, " " + bar(s.tree_rss_kb / biggest, 8), self.attr("bar"))
+        x = self.put(y, x, f"{human_mb(s.tree_rss_kb):>8}  ", sel)
+        usage = snap.usage.get(s.pid)
+        if usage:
+            level = context_level(usage.pct)
+            tone_ctx = {"ok": "bar", "warn": "warn", "critical": "error"}[level]
+            x = self.put(y, x, bar(usage.pct / 100, 6), self.attr(tone_ctx, curses.A_BOLD))
+            x = self.put(y, x, f"{usage.pct:>4.0f}% ", self.attr(tone_ctx))
+            cost = ("≥" if usage.partial else "") + fmt_usd(usage.cost_usd if usage.known else None)
+            x = self.put(y, x, f"{cost:>8}", sel)
+        else:
+            x = self.put(y, x, f"{'·' * 6}{'':>5} {'-':>8}", self.attr("dim"))
         self.put(y, x, you, self.attr("accent", curses.A_BOLD))
 
     def _tiers(self, y: int, width: int) -> int:
@@ -388,6 +447,7 @@ def read_key(screen) -> str | None:
         return None
     if isinstance(key, int):
         return {curses.KEY_UP: "KEY_UP", curses.KEY_DOWN: "KEY_DOWN", curses.KEY_ENTER: "KEY_ENTER",
+                curses.KEY_LEFT: "KEY_LEFT", curses.KEY_RIGHT: "KEY_RIGHT",
                 curses.KEY_BACKSPACE: "KEY_BACKSPACE", curses.KEY_RESIZE: "KEY_RESIZE"}.get(key, "")
     return "\n" if key == "\r" else key
 
@@ -408,10 +468,11 @@ def dashboard(screen) -> Action | None:
     curses.curs_set(0)
     screen.timeout(TICK_MS)
     view = View(screen)
-    state, snap, fetched, tick = UiState(), take_snapshot(), time.monotonic(), 0
+    book = UsageBook()
+    state, snap, fetched, tick = UiState(), take_snapshot(book), time.monotonic(), 0
     while True:
         if time.monotonic() - fetched >= REFRESH_SECONDS:
-            snap, fetched = take_snapshot(), time.monotonic()
+            snap, fetched = take_snapshot(book), time.monotonic()
         rows = visible(snap, state)
         state = clamp(state, len(rows))
         view.draw(snap, state, rows, tick)
@@ -424,7 +485,13 @@ def dashboard(screen) -> Action | None:
             continue
         if action[0] in {"quit", "launch", "worktree"}:
             return action
-        if action[0] == "doctor":
+        if action[0] == "team":
+            target = next((s for s in rows if s.pid == action[1]), None)
+            if target and target.session_id:
+                from .team_view import team_loop
+                if team_loop(screen, view, target.session_id, target.name, read_key) == "quit":
+                    return ("quit",)
+        elif action[0] == "doctor":
             from .cli import cmd_doctor
             pause_for(screen, lambda: cmd_doctor([]))
         elif action[0] == "close":
@@ -434,7 +501,22 @@ def dashboard(screen) -> Action | None:
         elif action[0] == "gc":
             message, kind = close_stale(snap)
             state = replace(state, message=message, message_kind=kind)
-        snap, fetched = take_snapshot(), time.monotonic()
+        snap, fetched = take_snapshot(book), time.monotonic()
+
+
+def run_team(session_id: str, session_name: str) -> int:
+    """`ccx team`: open the team view directly; ← or q exits."""
+    from .team_view import team_loop
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+
+    def loop(screen) -> str:
+        curses.curs_set(0)
+        screen.timeout(TICK_MS)
+        return team_loop(screen, View(screen), session_id, session_name, read_key)
+
+    curses.wrapper(loop)
+    return 0
 
 
 def run_dashboard() -> int:

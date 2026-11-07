@@ -279,6 +279,20 @@ def still_eligible(
     return False
 
 
+def duplicate_of(sessions: Iterable[Session]) -> dict[int, int]:
+    """pid -> pid of the earlier process holding the same conversation (resumed twice)."""
+    first: dict[str, int] = {}
+    dupes: dict[int, int] = {}
+    for s in sorted(sessions, key=lambda s: s.pid):
+        if not s.session_id:
+            continue
+        if s.session_id in first:
+            dupes[s.pid] = first[s.session_id]
+        else:
+            first[s.session_id] = s.pid
+    return dupes
+
+
 def protected_pids(procs: dict[int, Proc]) -> set[int]:
     me = os.getpid()
     guarded = {me} | ancestors(procs, me)

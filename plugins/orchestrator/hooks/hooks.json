@@ -1,5 +1,5 @@
 {
-  "description": "Inject the orchestrator routing policy on startup, /clear and after compaction (resumed sessions already carry it).",
+  "description": "Inject the orchestrator routing policy on startup, /clear and compaction; on resume only when the conversation hasn't received the current policy version yet.",
   "hooks": {
     "SessionStart": [
       {
@@ -10,7 +10,7 @@
             "timeout": 5
           }
         ],
-        "matcher": "startup|clear|compact"
+        "matcher": "startup|resume|clear|compact"
       }
     ]
   }

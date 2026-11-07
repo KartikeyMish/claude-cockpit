@@ -1,3 +1,3 @@
 """claude-cockpit: launcher, dashboard and session manager for Claude Code."""
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"

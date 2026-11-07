@@ -4,6 +4,7 @@
   ccx [claude args...]     start Claude here, named <repo>@<branch>
   ccx run [claude args...] same, explicitly (use when your prompt is a ccx word)
   ccx wt NAME [args...]    start Claude in a new git worktree NAME
+  ccx team [NAME|PID]      live view of the agents working inside a session
   ccx ls [--all] [--json]  running Claude sessions: state, idle time, RAM
   ccx mem [--json]         RAM breakdown: terminals, sessions, helpers
   ccx gc [--idle H] [--yes] [--dry-run]
@@ -24,9 +25,11 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import VERSION
+from .pricing import context_level, fmt_usd
+from .team import SessionUsage, UsageBook
 from .tiers import OVERRIDE_VARS
 from .core import (
-    CLAUDE_HOME, DEFAULT_IDLE_HOURS, SESSIONS_DIR, CockpitError, Session, current_ms, gc_candidates,
+    CLAUDE_HOME, DEFAULT_IDLE_HOURS, SESSIONS_DIR, CockpitError, duplicate_of, Session, current_ms, gc_candidates,
     human_duration, human_mb, is_claude_proc, load_sessions, parse_hours, protected_pids,
     read_processes, session_name, short_path, still_eligible, terminal_totals_kb, terminate,
     tree_rss_kb,
@@ -91,22 +94,46 @@ def cmd_worktree(args: list[str]) -> int:
 
 # ---------------------------------------------------------------- listing
 
-def session_row(s: Session, now: int) -> str:
+def usage_cells(usage: SessionUsage | None) -> str:
+    if usage is None:
+        return f"{'-':>5} {'-':>8}"
+    pct = f"{usage.pct:>4.0f}%"
+    level = context_level(usage.pct)
+    if level != "ok":
+        pct = color(pct, "31" if level == "critical" else "33")
+    cost = ("≥" if usage.partial else "") + fmt_usd(usage.cost_usd if usage.known else None)
+    return f"{pct} {cost:>8}"
+
+
+def session_row(s: Session, now: int, usage: SessionUsage | None = None) -> str:
     state = s.status or "?"
-    state_txt = color(f"{state:<6}", "32" if state == "busy" else "2")
+    state_txt = color(f"{state:<7}", {"busy": "32", "waiting": "1;33"}.get(state, "2"))
     idle = s.idle_seconds(now)
     idle_txt = f"{human_duration(idle):>7}"
     if idle and idle >= parse_hours(DEFAULT_IDLE_HOURS):
         idle_txt = color(idle_txt, "33")
     name = (s.name + (" [sdk]" if s.is_sdk else ""))[:28]
     return (f"{s.pid:>7}  {state_txt} {idle_txt} {human_mb(s.rss_kb):>8} "
-            f"{human_mb(s.tree_rss_kb):>8}  {name:<28} {short_path(s.cwd)}")
+            f"{human_mb(s.tree_rss_kb):>8} {usage_cells(usage)}  {name:<28} {short_path(s.cwd)}")
 
 
-def render_sessions(sessions: list[Session], now: int) -> None:
-    print(color(f"{'PID':>7}  {'STATE':<6} {'IDLE':>7} {'RAM':>8} {'+KIDS':>8}  {'NAME':<28} CWD", "1"))
+def render_sessions(sessions: list[Session], now: int, usage: dict[int, SessionUsage] | None = None) -> None:
+    usage = usage or {}
+    print(color(f"{'PID':>7}  {'STATE':<7} {'IDLE':>7} {'RAM':>8} {'+KIDS':>8} {'CTX':>5} {'COST':>8}  "
+                f"{'NAME':<28} CWD", "1"))
+    dupes = duplicate_of(sessions)
     for s in sorted(sessions, key=lambda x: x.idle_seconds(now) or -1, reverse=True):
-        print(session_row(s, now))
+        note = color(f"  ⧉ same chat as {dupes[s.pid]}", "33") if s.pid in dupes else ""
+        print(session_row(s, now, usage.get(s.pid)) + note)
+
+
+def usage_by_pid(sessions: list[Session]) -> dict[int, SessionUsage]:
+    book, found = UsageBook(), {}
+    for s in sessions:
+        usage = book.usage(s.session_id) if s.session_id else None
+        if usage:
+            found[s.pid] = usage
+    return found
 
 
 def check_flags(args: list[str], allowed: set[str], command: str) -> None:
@@ -121,16 +148,22 @@ def cmd_ls(args: list[str]) -> int:
     sessions = load_sessions(SESSIONS_DIR, read_processes(), now)
     if "--all" not in args:
         sessions = [s for s in sessions if not s.is_sdk]
+    usage = usage_by_pid(sessions)
     if "--json" in args:
-        rows = [dict(asdict(s), idle_seconds=s.idle_seconds(now), is_sdk=s.is_sdk) for s in sessions]
+        rows = [dict(asdict(s), idle_seconds=s.idle_seconds(now), is_sdk=s.is_sdk,
+                     usage=(dict(asdict(usage[s.pid]), pct=round(usage[s.pid].pct, 1)) if s.pid in usage else None))
+                for s in sessions]
         print(json.dumps(rows, indent=2))
         return 0
     if not sessions:
         print("No running Claude sessions found." + ("" if "--all" in args else " (try --all)"))
         return 0
-    render_sessions(sessions, now)
+    render_sessions(sessions, now, usage)
     total = sum(s.tree_rss_kb for s in sessions)
-    print(color(f"\n{len(sessions)} sessions · {human_mb(total)} incl. child processes", "2"))
+    dupes = duplicate_of(sessions)
+    spend = sum(u.cost_usd for pid, u in usage.items() if pid not in dupes)
+    print(color(f"\n{len(sessions)} sessions · {human_mb(total)} incl. child processes · "
+                f"≈{fmt_usd(spend)} API-equivalent spend", "2"))
     return 0
 
 
@@ -314,6 +347,11 @@ def doctor_sessions() -> bool:
     sessions = [s for s in load_sessions(SESSIONS_DIR, procs, now) if not s.is_sdk]
     stale = gc_candidates(sessions, now, parse_hours(DEFAULT_IDLE_HOURS), protected_pids(procs))
     label = f"{len(sessions)} interactive sessions"
+    usage = usage_by_pid(sessions)
+    full = [s for s in sessions if s.pid in usage and context_level(usage[s.pid].pct) == "critical"]
+    if full:
+        names = ", ".join(f"{s.name} ({usage[s.pid].pct:.0f}%)" for s in full)
+        check(None, f"context nearly full: {names}", "run /compact in those sessions or start fresh")
     if stale:
         held = human_mb(sum(s.tree_rss_kb for s in stale))
         return check(None, f"{label}; {len(stale)} idle > {DEFAULT_IDLE_HOURS}h hold {held}", "ccx gc")
@@ -359,9 +397,34 @@ def cmd_dashboard(_args: list[str]) -> int:
     return run_dashboard()
 
 
+def pick_session(sessions: list[Session], query: str | None, now: int) -> Session | None:
+    """By pid, else by name substring, else the most recently active interactive session."""
+    candidates = [s for s in sessions if s.session_id and not s.is_sdk]
+    if query and query.isdigit():
+        return next((s for s in sessions if s.pid == int(query)), None)
+    if query:
+        needle = query.lower()
+        return next((s for s in candidates if needle in s.name.lower()), None)
+    ranked = sorted(candidates, key=lambda s: (s.status != "busy", s.idle_seconds(now) or 0))
+    return ranked[0] if ranked else None
+
+
+def cmd_team(args: list[str]) -> int:
+    if len(args) > 1 or (args and args[0].startswith("-")):
+        raise CockpitError("usage: ccx team [session name or pid]")
+    now = current_ms()
+    target = pick_session(load_sessions(SESSIONS_DIR, read_processes(), now), args[0] if args else None, now)
+    if not target or not target.session_id:
+        raise CockpitError("no matching Claude session; see `ccx ls`")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise CockpitError("the team view needs a terminal")
+    from .tui import run_team
+    return run_team(target.session_id, target.name)
+
+
 COMMANDS = {
     "ls": cmd_ls, "mem": cmd_mem, "gc": cmd_gc, "doctor": cmd_doctor, "wt": cmd_worktree,
-    "run": cmd_launch, "ui": cmd_dashboard,
+    "run": cmd_launch, "ui": cmd_dashboard, "team": cmd_team,
 }
 
 

@@ -53,14 +53,17 @@ def split_tools(value):
     return {t.strip() for t in value.split(",") if t.strip()}
 
 
-def run_hook(env_overrides):
+def run_hook(env_overrides, source="startup", transcript=None):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("COCKPIT_", "EVAL_COCKPIT_"))}
     env.update({"CLAUDE_PLUGIN_ROOT": str(PLUGIN)})
     env.update(env_overrides)
+    payload = {"hook_event_name": "SessionStart", "source": source}
+    if transcript:
+        payload["transcript_path"] = str(transcript)
     return subprocess.run(
         ["bash", str(HOOK)],
-        input='{"hook_event_name":"SessionStart","source":"startup"}',
+        input=json.dumps(payload),
         capture_output=True,
         text=True,
         env=env,
@@ -114,9 +117,21 @@ class AgentDefinitionTests(unittest.TestCase):
                 row = next(line for line in policy.splitlines() if f"`orchestrator:{name}`" in line)
                 self.assertIn(f"{model.capitalize()} · {effort}", row)
 
-    def test_hook_skips_resume_and_fork(self):
+    def test_hook_runs_on_every_session_start_source(self):
         hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())
-        self.assertEqual(hooks["hooks"]["SessionStart"][0]["matcher"], "startup|clear|compact")
+        self.assertEqual(hooks["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact")
+
+    def test_policy_title_carries_plugin_version(self):
+        version = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())["version"]
+        major_minor = ".".join(version.split(".")[:2])
+        self.assertEqual(POLICY.read_text().splitlines()[0],
+                         f"# Orchestrator routing (claude-cockpit policy v{major_minor})")
+
+    def test_policy_requires_a_plan_and_fan_out(self):
+        policy = POLICY.read_text()
+        for phrase in ("Plan first", "Plan: <goal", "parallel", "[inline]", "Checkpoint",
+                       "One owner per working tree", "Tiny"):
+            self.assertIn(phrase, policy)
 
     def test_colors_are_distinct(self):
         colors = [parse_frontmatter(AGENTS / f"{n}.md")[0]["color"] for n in EXPECTED_TIERS]
@@ -188,6 +203,38 @@ class RoutingHookTests(unittest.TestCase):
         result = run_hook({"CLAUDE_CODE_ENTRYPOINT": "cli", "COCKPIT_ROUTING": "off",
                            "EVAL_COCKPIT_ROUTING": "on"})
         self.assertEqual(result.stdout.strip(), "")
+
+    def write_transcript(self, tmp, line):
+        path = Path(tmp) / "t.jsonl"
+        path.write_text(json.dumps(line) + "\n")
+        return path
+
+    def test_resume_injects_when_conversation_has_older_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.write_transcript(tmp, {"type": "attachment", "attachment": {
+                "type": "hook_success", "hookEvent": "SessionStart",
+                "content": "# Orchestrator routing (claude-cockpit)\nold policy"}})
+            result = run_hook({"CLAUDE_CODE_ENTRYPOINT": "cli"}, source="resume", transcript=old)
+            self.assertIn("orchestrator:scout", result.stdout)
+
+    def test_resume_skips_when_current_policy_already_delivered(self):
+        title = POLICY.read_text().splitlines()[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            done = self.write_transcript(tmp, {"type": "attachment", "attachment": {
+                "type": "hook_success", "hookEvent": "SessionStart", "content": title + "\n..."}})
+            result = run_hook({"CLAUDE_CODE_ENTRYPOINT": "cli"}, source="resume", transcript=done)
+            self.assertEqual((result.returncode, result.stdout.strip()), (0, ""))
+
+    def test_resume_ignores_mere_mentions_of_the_policy(self):
+        title = POLICY.read_text().splitlines()[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            chat = self.write_transcript(tmp, {"type": "user", "message": {"content": "about " + title}})
+            result = run_hook({"CLAUDE_CODE_ENTRYPOINT": "cli"}, source="resume", transcript=chat)
+            self.assertIn("orchestrator:scout", result.stdout)
+
+    def test_resume_without_readable_transcript_injects(self):
+        result = run_hook({"CLAUDE_CODE_ENTRYPOINT": "cli"}, source="resume", transcript="/nonexistent.jsonl")
+        self.assertIn("orchestrator:scout", result.stdout)
 
     def test_missing_policy_file_fails_soft(self):
         result = run_hook({"CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_PLUGIN_ROOT": "/nonexistent"})

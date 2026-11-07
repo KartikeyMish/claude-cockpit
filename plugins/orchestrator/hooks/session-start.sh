@@ -2,8 +2,10 @@
 # SessionStart hook: injects the orchestrator routing policy as session context.
 #
 # Plain stdout from a SessionStart hook is added to the model's context.
-# It runs on startup, resume, /clear and after compaction, so the policy
-# survives context resets.
+#   startup, clear, compact  always inject (fresh or reset context)
+#   resume                   inject only if this conversation hasn't already received
+#                            *this version* of the policy, so a resumed session picks
+#                            up policy updates without getting a duplicate copy
 #
 # Controls (environment):
 #   COCKPIT_ROUTING=off   never inject (per shell or per session)
@@ -14,8 +16,8 @@
 #                         sessions (memory observers, IDE bridges, scripts)
 #                         are skipped so they don't pay the extra tokens.
 #
-# This hook must never block or fail a session: every path exits 0, it never
-# reads stdin, and it only prints the policy to stdout.
+# This hook must never block or fail a session: every path exits 0, stdin is
+# read with a timeout, and only the policy is printed to stdout.
 
 set -u
 
@@ -41,6 +43,24 @@ policy="${CLAUDE_PLUGIN_ROOT:-}/hooks/routing-policy.md"
 if [ ! -r "$policy" ]; then
   echo "orchestrator: routing policy not found at $policy; skipping injection" >&2
   exit 0
+fi
+
+# Hook input JSON: {"source": "startup|resume|clear|compact", "transcript_path": "...", ...}
+input=""
+IFS= read -r -d '' -t 2 input 2>/dev/null || true
+json_field() {
+  printf '%s' "$input" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" | head -n 1
+}
+source="$(json_field source)"
+transcript="$(json_field transcript_path)"
+
+if [ "$source" = "resume" ] && [ -n "$transcript" ] && [ -r "$transcript" ]; then
+  marker="$(head -n 1 "$policy")"   # e.g. "# Orchestrator routing (claude-cockpit policy v1.3)"
+  # Already delivered by this hook (not merely mentioned in conversation)? Then skip.
+  if grep -F -- "$marker" "$transcript" 2>/dev/null \
+     | grep -qE '"hookEvent"[[:space:]]*:[[:space:]]*"SessionStart"'; then
+    exit 0
+  fi
 fi
 
 cat "$policy" 2>/dev/null || true
