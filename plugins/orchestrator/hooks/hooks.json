@@ -1,0 +1,17 @@
+{
+  "description": "Inject the orchestrator routing policy on startup, /clear and after compaction (resumed sessions already carry it).",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh\"",
+            "timeout": 5
+          }
+        ],
+        "matcher": "startup|clear|compact"
+      }
+    ]
+  }
+}

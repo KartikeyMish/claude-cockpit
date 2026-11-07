@@ -1,0 +1,7 @@
+{
+  "name": "orchestrator",
+  "version": "1.2.0",
+  "description": "Five-tier agent team (scout, routine-worker, senior-engineer, debugger, architect) with model and effort matched to task difficulty, plus a routing policy that makes the main session delegate to them by default.",
+  "author": { "name": "Kartikey Mishra" },
+  "keywords": ["orchestration", "subagents", "routing", "effort", "productivity"]
+}

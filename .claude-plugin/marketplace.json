@@ -1,0 +1,16 @@
+{
+  "name": "claude-cockpit",
+  "owner": { "name": "Kartikey Mishra" },
+  "metadata": {
+    "description": "A lean, orchestrated Claude Code setup: tiered agents, routing by default, and a low-memory terminal profile."
+  },
+  "plugins": [
+    {
+      "name": "orchestrator",
+      "source": "./plugins/orchestrator",
+      "version": "1.2.0",
+      "description": "Tiered agents (Sonnet scout → Opus max architect) and default routing policy.",
+      "category": "productivity"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "name": "Cockpit",
+  "base": "dark",
+  "overrides": {
+    "claude": "#cba6f7",
+    "claudeShimmer": "#e2cffb",
+    "text": "#cdd6f4",
+    "inactive": "#7f849c",
+    "subtle": "#45475a",
+    "suggestion": "#89b4fa",
+    "permission": "#f9e2af",
+    "success": "#a6e3a1",
+    "error": "#f38ba8",
+    "warning": "#f9e2af",
+    "promptBorder": "#585b70",
+    "planMode": "#89dceb",
+    "autoAccept": "#a6e3a1",
+    "diffAdded": "#1f3a2b",
+    "diffRemoved": "#3d1f2a",
+    "diffAddedWord": "#2f5a40",
+    "diffRemovedWord": "#5e2c3c",
+    "userMessageBackground": "#262637",
+    "cyan_FOR_SUBAGENTS_ONLY": "#89dceb",
+    "green_FOR_SUBAGENTS_ONLY": "#a6e3a1",
+    "blue_FOR_SUBAGENTS_ONLY": "#89b4fa",
+    "red_FOR_SUBAGENTS_ONLY": "#f38ba8",
+    "purple_FOR_SUBAGENTS_ONLY": "#cba6f7"
+  }
+}

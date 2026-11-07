@@ -1,0 +1,390 @@
+"""ccx commands. `ccx` with no arguments opens the dashboard (see tui.py).
+
+  ccx                      interactive cockpit dashboard
+  ccx [claude args...]     start Claude here, named <repo>@<branch>
+  ccx run [claude args...] same, explicitly (use when your prompt is a ccx word)
+  ccx wt NAME [args...]    start Claude in a new git worktree NAME
+  ccx ls [--all] [--json]  running Claude sessions: state, idle time, RAM
+  ccx mem [--json]         RAM breakdown: terminals, sessions, helpers
+  ccx gc [--idle H] [--yes] [--dry-run]
+                           close sessions idle >= H hours (default 6); they stay
+                           resumable with `claude --resume`
+  ccx doctor               check the cockpit setup end to end
+  ccx version
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import asdict
+from pathlib import Path
+
+from . import VERSION
+from .tiers import OVERRIDE_VARS
+from .core import (
+    CLAUDE_HOME, DEFAULT_IDLE_HOURS, SESSIONS_DIR, CockpitError, Session, current_ms, gc_candidates,
+    human_duration, human_mb, is_claude_proc, load_sessions, parse_hours, protected_pids,
+    read_processes, session_name, short_path, still_eligible, terminal_totals_kb, terminate,
+    tree_rss_kb,
+)
+
+PLUGIN_ID = "orchestrator@claude-cockpit"
+GHOSTTY_DIR = Path(os.path.expanduser(os.environ.get("XDG_CONFIG_HOME", "~/.config"))) / "ghostty"
+GHOSTTY_APP_BIN = "/Applications/Ghostty.app/Contents/MacOS/ghostty"
+NO_AUTO_NAME = {"-n", "--name", "-r", "--resume", "-c", "--continue", "-p", "--print"}
+
+
+def color(text: str, code: str, stream=None) -> str:
+    stream = stream or sys.stdout
+    if not stream.isatty() or os.environ.get("NO_COLOR"):
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+# ---------------------------------------------------------------- launching
+
+def git_branch(cwd: str) -> str | None:
+    try:
+        out = subprocess.run(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+                             capture_output=True, text=True, timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    branch = out.stdout.strip()
+    return branch if out.returncode == 0 and branch and branch != "HEAD" else None
+
+
+def require_claude() -> str:
+    path = shutil.which("claude")
+    if not path:
+        raise CockpitError("`claude` is not on PATH. Install: https://code.claude.com/docs/en/setup")
+    return path
+
+
+def launch_argv(claude: str, args: list[str], cwd: str) -> list[str]:
+    argv = [claude, *args]
+    if not NO_AUTO_NAME.intersection(a.split("=", 1)[0] for a in args):
+        argv[1:1] = ["-n", session_name(cwd, git_branch(cwd))]
+    return argv
+
+
+def cmd_launch(args: list[str]) -> int:
+    claude = require_claude()
+    os.execv(claude, launch_argv(claude, args, os.getcwd()))
+    return 0  # unreachable
+
+
+def worktree_argv(claude: str, args: list[str]) -> list[str]:
+    if not args or args[0].startswith("-"):
+        raise CockpitError("usage: ccx wt NAME [claude args...]")
+    return [claude, "-w", args[0], "-n", args[0], *args[1:]]
+
+
+def cmd_worktree(args: list[str]) -> int:
+    claude = require_claude()
+    os.execv(claude, worktree_argv(claude, args))
+    return 0  # unreachable
+
+
+# ---------------------------------------------------------------- listing
+
+def session_row(s: Session, now: int) -> str:
+    state = s.status or "?"
+    state_txt = color(f"{state:<6}", "32" if state == "busy" else "2")
+    idle = s.idle_seconds(now)
+    idle_txt = f"{human_duration(idle):>7}"
+    if idle and idle >= parse_hours(DEFAULT_IDLE_HOURS):
+        idle_txt = color(idle_txt, "33")
+    name = (s.name + (" [sdk]" if s.is_sdk else ""))[:28]
+    return (f"{s.pid:>7}  {state_txt} {idle_txt} {human_mb(s.rss_kb):>8} "
+            f"{human_mb(s.tree_rss_kb):>8}  {name:<28} {short_path(s.cwd)}")
+
+
+def render_sessions(sessions: list[Session], now: int) -> None:
+    print(color(f"{'PID':>7}  {'STATE':<6} {'IDLE':>7} {'RAM':>8} {'+KIDS':>8}  {'NAME':<28} CWD", "1"))
+    for s in sorted(sessions, key=lambda x: x.idle_seconds(now) or -1, reverse=True):
+        print(session_row(s, now))
+
+
+def check_flags(args: list[str], allowed: set[str], command: str) -> None:
+    unknown = [a for a in args if a not in allowed]
+    if unknown:
+        raise CockpitError(f"ccx {command}: unknown option {unknown[0]!r} (allowed: {', '.join(sorted(allowed))})")
+
+
+def cmd_ls(args: list[str]) -> int:
+    check_flags(args, {"--all", "--json"}, "ls")
+    now = current_ms()
+    sessions = load_sessions(SESSIONS_DIR, read_processes(), now)
+    if "--all" not in args:
+        sessions = [s for s in sessions if not s.is_sdk]
+    if "--json" in args:
+        rows = [dict(asdict(s), idle_seconds=s.idle_seconds(now), is_sdk=s.is_sdk) for s in sessions]
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not sessions:
+        print("No running Claude sessions found." + ("" if "--all" in args else " (try --all)"))
+        return 0
+    render_sessions(sessions, now)
+    total = sum(s.tree_rss_kb for s in sessions)
+    print(color(f"\n{len(sessions)} sessions · {human_mb(total)} incl. child processes", "2"))
+    return 0
+
+
+def memory_report(procs: dict, sessions: list[Session]) -> dict[str, int]:
+    known = {s.pid for s in sessions}
+    stray = [p for p in procs.values() if is_claude_proc(p) and p.pid not in known]
+    report = {f"terminal: {k}": v for k, v in terminal_totals_kb(procs).items()}
+    report["claude: interactive sessions"] = sum(s.tree_rss_kb for s in sessions if not s.is_sdk)
+    report["claude: sdk/background sessions"] = sum(s.tree_rss_kb for s in sessions if s.is_sdk)
+    report["claude: unregistered processes"] = sum(tree_rss_kb(procs, p.pid) for p in stray)
+    return report
+
+
+def cmd_mem(args: list[str]) -> int:
+    check_flags(args, {"--json"}, "mem")
+    procs = read_processes()
+    now = current_ms()
+    sessions = load_sessions(SESSIONS_DIR, procs, now)
+    report = memory_report(procs, sessions)
+    if "--json" in args:
+        print(json.dumps({k: v * 1024 for k, v in report.items()}, indent=2))
+        return 0
+    width = max(len(k) for k in report)
+    for key, kb in sorted(report.items(), key=lambda kv: -kv[1]):
+        print(f"  {key:<{width}}  {human_mb(kb):>9}")
+    print(color(f"  {'total':<{width}}  {human_mb(sum(report.values())):>9}", "1"))
+    reclaim = gc_candidates(sessions, now, parse_hours(DEFAULT_IDLE_HOURS), protected_pids(procs))
+    if reclaim:
+        freed = human_mb(sum(s.tree_rss_kb for s in reclaim))
+        print(color(f"\n  {len(reclaim)} sessions idle > {DEFAULT_IDLE_HOURS}h hold {freed}: run `ccx gc`", "33"))
+    return 0
+
+
+# ---------------------------------------------------------------- gc
+
+def parse_gc_args(args: list[str]) -> tuple[int, bool, bool]:
+    idle, assume_yes, dry_run = DEFAULT_IDLE_HOURS, False, False
+    rest = list(args)
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--yes":
+            assume_yes = True
+        elif arg == "--dry-run":
+            dry_run = True
+        elif arg == "--idle":
+            if not rest:
+                raise ValueError("--idle needs a number of hours")
+            idle = rest.pop(0)
+        elif arg.startswith("--idle="):
+            idle = arg.split("=", 1)[1]
+        else:
+            raise ValueError(f"unknown option {arg!r} (allowed: --idle H, --yes, --dry-run)")
+    return parse_hours(idle), assume_yes, dry_run
+
+
+def close_sessions(picked: list[Session], min_idle: int, report=print) -> int:
+    """Close each session only if it is still exactly as listed. Returns failures."""
+    failures = 0
+    for s in picked:
+        procs = read_processes()
+        fresh = load_sessions(SESSIONS_DIR, procs)
+        if not still_eligible(s, fresh, current_ms(), min_idle, protected_pids(procs)):
+            report(f"  skip   {s.pid} {s.name}: used since listing")
+            continue
+        ok = terminate(s.pid)
+        failures += 0 if ok else 1
+        report(f"  {'closed' if ok else 'still running'}  {s.pid} {s.name}  ({human_mb(s.tree_rss_kb)})")
+    return failures
+
+
+def confirm(question: str) -> bool:
+    if not sys.stdin.isatty():
+        raise CockpitError("not a terminal; re-run with --yes to confirm")
+    try:
+        return input(question).strip().lower() in {"y", "yes"}
+    except EOFError:
+        return False
+
+
+def cmd_gc(args: list[str]) -> int:
+    try:
+        min_idle, assume_yes, dry_run = parse_gc_args(args)
+    except ValueError as exc:
+        raise CockpitError(f"ccx gc: {exc}") from exc
+    procs = read_processes()
+    now = current_ms()
+    picked = gc_candidates(load_sessions(SESSIONS_DIR, procs, now), now, min_idle, protected_pids(procs))
+    if not picked:
+        print(f"Nothing to close: no interactive session idle ≥ {human_duration(min_idle)}.")
+        return 0
+    render_sessions(picked, now)
+    freed = human_mb(sum(s.tree_rss_kb for s in picked))
+    print(f"\n{len(picked)} idle sessions hold {freed}. Each stays resumable with `claude --resume`.")
+    if dry_run:
+        return 0
+    if not assume_yes and not confirm("Close them? [y/N] "):
+        print("Left them running.")
+        return 0
+    return 1 if close_sessions(picked, min_idle) else 0
+
+
+# ---------------------------------------------------------------- doctor
+
+def check(ok: bool | None, label: str, hint: str = "") -> bool:
+    mark = {True: color("✓", "32"), False: color("✗", "31"), None: color("!", "33")}[ok]
+    print(f"  {mark} {label}" + (color(f"  → {hint}", "2") if hint and ok is not True else ""))
+    return ok is not False
+
+
+def run_quiet(argv: list[str], timeout: int = 30) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def doctor_claude() -> bool:
+    path = shutil.which("claude")
+    if not path:
+        return check(False, "claude CLI on PATH", "install from https://code.claude.com/docs/en/setup")
+    out = run_quiet([path, "--version"], 20)
+    return check(bool(out and out.returncode == 0),
+                 f"claude CLI: {out.stdout.strip() if out else 'did not answer'}")
+
+
+def installed_plugin() -> dict | None:
+    out = run_quiet(["claude", "plugin", "list", "--json"])
+    try:
+        plugins = json.loads(out.stdout) if out else []
+    except ValueError:
+        return None
+    if not isinstance(plugins, list):
+        return None
+    return next((p for p in plugins if isinstance(p, dict) and p.get("id") == PLUGIN_ID), {})
+
+
+def doctor_plugin() -> bool:
+    if not shutil.which("claude"):
+        return check(False, "orchestrator plugin", "needs the claude CLI")
+    entry = installed_plugin()
+    if entry is None:
+        return check(None, "orchestrator plugin", "could not read `claude plugin list --json`")
+    if not entry:
+        return check(False, "orchestrator plugin installed", "run ./install.sh")
+    if not entry.get("enabled"):
+        return check(False, "orchestrator plugin enabled", f"claude plugin enable {PLUGIN_ID}")
+    root = entry.get("installPath")
+    agents = sorted(p.stem for p in Path(root).glob("agents/*.md")) if root else []
+    return check(len(agents) == 5, f"orchestrator {entry.get('version')} enabled · agents: {', '.join(agents) or 'none'}")
+
+
+def doctor_routing() -> bool:
+    mode = os.environ.get("COCKPIT_ROUTING", "auto")
+    return check(None if mode in {"off", "0", "false", "no"} else True,
+                 f"routing policy injection: {mode}", "unset COCKPIT_ROUTING to re-enable")
+
+
+def ghostty_binary() -> str | None:
+    return shutil.which("ghostty") or (GHOSTTY_APP_BIN if Path(GHOSTTY_APP_BIN).exists() else None)
+
+
+def doctor_terminal() -> bool:
+    term = os.environ.get("TERM_PROGRAM", "unknown")
+    in_tmux = bool(os.environ.get("TMUX"))
+    ok = check(None if in_tmux else True, f"terminal: {term}" + (" (inside tmux)" if in_tmux else ""),
+               "tmux needs allow-passthrough + extended-keys; see README")
+    ghostty = ghostty_binary()
+    if not ghostty:
+        return check(None, "Ghostty installed", "./install.sh --with-ghostty") and ok
+    check((GHOSTTY_DIR / "cockpit.conf").exists(), "Ghostty cockpit profile", "./install.sh --with-ghostty")
+    out = run_quiet([ghostty, "+validate-config"], 20)
+    detail = " | ".join(((out.stdout + out.stderr).strip().splitlines() if out else ["no answer"])[:3])
+    return check(bool(out and out.returncode == 0), "Ghostty config valid", detail) and ok
+
+
+def doctor_sessions() -> bool:
+    if not SESSIONS_DIR.is_dir():
+        return check(None, "session registry", f"{SESSIONS_DIR} missing; `ccx ls` will be empty")
+    procs = read_processes()
+    now = current_ms()
+    sessions = [s for s in load_sessions(SESSIONS_DIR, procs, now) if not s.is_sdk]
+    stale = gc_candidates(sessions, now, parse_hours(DEFAULT_IDLE_HOURS), protected_pids(procs))
+    label = f"{len(sessions)} interactive sessions"
+    if stale:
+        held = human_mb(sum(s.tree_rss_kb for s in stale))
+        return check(None, f"{label}; {len(stale)} idle > {DEFAULT_IDLE_HOURS}h hold {held}", "ccx gc")
+    return check(True, label)
+
+
+def settings_env(path: Path) -> dict[str, str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    env = data.get("env") if isinstance(data, dict) else None
+    return {str(k): str(v) for k, v in env.items()} if isinstance(env, dict) else {}
+
+
+def tier_overrides(environ: dict[str, str], settings: dict[str, str]) -> list[str]:
+    """Env vars that would flatten every tier to one model or effort."""
+    return [f"{name}={(environ.get(name) or settings.get(name))}"
+            for name in OVERRIDE_VARS if environ.get(name) or settings.get(name)]
+
+
+def doctor_overrides() -> bool:
+    found = tier_overrides(dict(os.environ), settings_env(CLAUDE_HOME / "settings.json"))
+    if found:
+        return check(None, "tier models/efforts are overridden: " + ", ".join(found),
+                     "unset these so each agent runs its own model and effort")
+    return check(True, "agents run their own model and effort (no global overrides)")
+
+
+def cmd_doctor(_args: list[str]) -> int:
+    print(color(f"claude-cockpit doctor (ccx {VERSION})", "1"))
+    results = [doctor_claude(), doctor_plugin(), doctor_overrides(), doctor_routing(),
+               doctor_terminal(), doctor_sessions()]
+    return 0 if all(results) else 1
+
+
+# ---------------------------------------------------------------- entry
+
+def cmd_dashboard(_args: list[str]) -> int:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return cmd_ls([])
+    from .tui import run_dashboard  # curses only loads when needed
+    return run_dashboard()
+
+
+COMMANDS = {
+    "ls": cmd_ls, "mem": cmd_mem, "gc": cmd_gc, "doctor": cmd_doctor, "wt": cmd_worktree,
+    "run": cmd_launch, "ui": cmd_dashboard,
+}
+
+
+def dispatch(argv: list[str]) -> int:
+    if not argv:
+        return cmd_dashboard([])
+    head = argv[0]
+    if head in {"-h", "--help", "help"}:
+        print(__doc__.strip())
+        return 0
+    if head in {"version", "--version", "-V"}:
+        print(f"ccx {VERSION}")
+        return 0
+    if head in COMMANDS:
+        return COMMANDS[head](argv[1:])
+    return cmd_launch(argv)
+
+
+def main(argv: list[str]) -> int:
+    try:
+        return dispatch(argv)
+    except CockpitError as exc:
+        print(color(f"ccx: {exc}", "31", sys.stderr), file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130

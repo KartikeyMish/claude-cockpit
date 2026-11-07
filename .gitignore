@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+plugins/orchestrator/evals/results/
+*.cockpit-backup-*
