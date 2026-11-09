@@ -1,6 +1,6 @@
 ---
-description: A small edit in a known file is done inline, without spawning agents.
-tags: [routing, negative]
+description: A one-line edit in a known file goes to an editing tier, and the edit lands.
+tags: [routing, short]
 runs: 3
 max_turns: 12
 allowed_tools: [Agent, Read, Glob, Grep, Edit, Write]

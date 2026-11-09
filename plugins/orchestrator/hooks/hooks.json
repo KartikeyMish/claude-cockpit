@@ -1,6 +1,29 @@
 {
-  "description": "Inject the orchestrator routing policy on startup, /clear and compaction; on resume only when the conversation hasn't received the current policy version yet.",
+  "description": "Inject the orchestrator routing policy on startup, /clear and compaction (on resume only when the conversation lacks the current version); remind on each prompt and keep main-thread work delegated.",
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I -S \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|Bash|PowerShell|WebFetch|WebSearch|Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I -S \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [

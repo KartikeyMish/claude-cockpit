@@ -40,11 +40,33 @@ Three parts, each usable on its own:
 | `orchestrator:debugger` | Opus · xhigh | Intermittent bugs, races, leaks, incidents, regressions with unclear cause |
 | `orchestrator:architect` | Opus · max · **read-only** | Decisions that are hard to undo, when you ask for one: boundaries, data models, API shape, vendors, migration plans |
 
-The main session stays the **orchestrator** and your second brain. Tiny things (one known file, a few tool calls) it just does. Anything multi-step opens with a short **visible plan**: workstreams, the tier for each, what runs in parallel, what stays inline and why, and how it will be verified. Then independent workstreams fan out to agents at once. Work tied to state it holds (sequential git on one working tree) stays with one owner, and after ~15 inline tool calls it re-plans. It picks the lowest tier that fits, escalates once and then asks you, allows at most one review pass, and verifies agent output before reporting. It decides instead of asking, keeps track of open loops, and reports outcomes in plain language. The full policy is in [`plugins/orchestrator/hooks/routing-policy.md`](plugins/orchestrator/hooks/routing-policy.md).
+The main session stays the **orchestrator** and your second brain: it plans, briefs, owns git state, reviews and verifies. **Agents do the work, short requests included.** A one-file lookup goes to scout and a one-line edit goes to routine-worker. Anything multi-step opens with a short **visible plan** where every step names a tier. Independent steps launch in parallel, and edits in the same repo still go to agents (one at a time, or isolated worktrees).
+
+### Delegation guard
+
+The policy asks; the guard enforces it. The plugin's `UserPromptSubmit` and `PreToolUse` hooks act on the **main thread only**. Calls made inside an agent carry an `agent_id` and pass through untouched.
+
+| In the main thread | What happens |
+|---|---|
+| Edit / Write / NotebookEdit | Blocked, with a note to brief routine-worker or senior-engineer. Files under `~/.claude` (memory, plans, settings) are exempt. |
+| Read / Grep / Glob / Bash / WebFetch / WebSearch | Blocked until an agent has been launched for the request. After each launch, 3 calls are allowed for checking the result. |
+| Shell commands made only of `git`/`gh` (plus `cd`, and pipes into `head`, `grep` and the like), agent output files, MCP tools, questions to you | Never limited |
+| Each prompt you send | Gets a one-line routing reminder (about 40 tokens) |
+
+When you want it done in the main thread, say so: *"do it yourself"*, *"no agents needed"*, *"don't delegate"*. That request then runs inline. Complaints like "why were no agents spun up?" don't count as asking for inline work.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COCKPIT_GUARD=off` | on | Keep the policy and reminder, drop enforcement |
+| `COCKPIT_START_BUDGET` | `0` | Inline calls allowed before the first agent launch |
+| `COCKPIT_VERIFY_BUDGET` | `3` | Inline calls allowed after each agent launch |
+| `COCKPIT_ROUTING=off` | auto | Turns off policy, reminder and guard |
+
+The guard fails open. If Python is missing or anything errors, the tool call goes through. It needs a Claude Code version that stamps hook calls with `prompt_id` and `agent_id` (2.1.319 does). On older versions it stands down rather than risk blocking an agent.
 
 **Built-in cost guards:** agents can't spawn agents; every agent has a turn limit and a report word cap; scout and architect are read-only by allowlist; the policy is injected on startup, `/clear` and compaction, and on resume only when that conversation doesn't have the current version yet; headless and SDK sessions skip it.
 
-**Fixed cost:** about 1.5k tokens per session (policy plus the five agent descriptions). That's cached after the first request. The real cost driver is delegation itself: each agent starts a fresh context, which is why inline is the default.
+**Fixed cost:** about 1.5k tokens per session (policy plus the five agent descriptions), plus about 40 tokens per prompt for the reminder. That's cached after the first request. The real cost driver is delegation itself: each agent starts a fresh context, which is why short requests cost a little more than they would inline. That's the trade for quality and a main context that stays small.
 
 ## Install
 
@@ -137,8 +159,8 @@ Effort scales token use. `scout` is the cheapest way to gather context. `archite
 Treat it as a pilot, not a mandate:
 1. Host the repo (git) and install from the remote so everyone gets updates through `/plugin update`.
 2. Pilot with a handful of developers for two weeks alongside a control group. Compare `/usage`, or OpenTelemetry cost and token metrics, plus the outcomes people care about: PRs merged and rework.
-3. Run `make eval` before every change to the agents or policy. It checks that each kind of task reaches the right tier, that small edits stay inline, and that migrations never reach the max-effort architect.
-4. Keep opt-outs easy (above) and listen for "it delegated when it shouldn't have".
+3. Run `make eval` before every change to the agents or policy. It checks that each kind of task reaches the right tier, that short lookups and edits are delegated too, that "do it yourself" stays inline, and that migrations never reach the max-effort architect.
+4. Keep opt-outs easy (above) and listen for "it delegated when it shouldn't have". `COCKPIT_START_BUDGET=1` gives the orchestrator one look before it delegates.
 
 ## Why Ghostty, and where the memory goes
 
@@ -152,13 +174,13 @@ The profile avoids transparency, blur, shaders and cursor blink, and keeps the d
 ## Develop & verify
 
 ```bash
-make test       # 103 stdlib tests: agents, guards, hook, status line, pricing, context, team view, dashboard + real pty runs
+make test       # 143 stdlib tests: agents, guards, hook, status line, pricing, context, team view, dashboard + real pty runs
 make validate   # Claude's validator on plugin + marketplace
 make lint       # shellcheck + ruff, if installed
 make eval       # routing evals (claude plugin eval), capped spend; use --ablation with-without to compare against no plugin
 ```
 
-Evals live in `plugins/orchestrator/evals/`: one case per tier on a 51-file fixture service, plus negative cases. A trivial question and a small edit must stay inline, with the edit actually landing, and a migration must never reach architect.
+Evals live in `plugins/orchestrator/evals/`: one case per tier on a 51-file fixture service, plus negative cases. A one-file question and a one-line edit must be delegated (and the edit must land). "Do it yourself" must stay inline, and a migration must never reach architect.
 
 When you change a tier, bump `version` in both `plugins/orchestrator/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` (a test enforces they match), then run `./install.sh` or `/plugin update`.
 

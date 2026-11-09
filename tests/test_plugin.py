@@ -129,9 +129,20 @@ class AgentDefinitionTests(unittest.TestCase):
 
     def test_policy_requires_a_plan_and_fan_out(self):
         policy = POLICY.read_text()
-        for phrase in ("Plan first", "Plan: <goal", "parallel", "[inline]", "Checkpoint",
-                       "One owner per working tree", "Tiny"):
+        for phrase in ("Plan first", "Plan: <goal", "parallel", "[inline: git]", "Agents do the work",
+                       "not a reason to stay inline", "Every step names a tier"):
             self.assertIn(phrase, policy)
+
+    def test_policy_sends_short_requests_to_agents_and_names_the_guard(self):
+        policy = POLICY.read_text()
+        for phrase in ("short requests included", "even a one-file lookup or a one-line edit",
+                       "your first tool call is the Agent call", "The plugin enforces this", "do it yourself"):
+            self.assertIn(phrase, policy)
+        self.assertNotIn("Tiny requests", policy)
+        self.assertNotIn("Inline budget", policy)
+
+    def test_policy_supersedes_earlier_versions(self):
+        self.assertIn("replaces any earlier claude-cockpit routing policy", POLICY.read_text())
 
     def test_colors_are_distinct(self):
         colors = [parse_frontmatter(AGENTS / f"{n}.md")[0]["color"] for n in EXPECTED_TIERS]
