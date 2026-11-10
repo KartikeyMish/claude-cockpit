@@ -4,6 +4,8 @@ All notable changes to claude-cockpit. The `orchestrator` plugin, `ccx` and the 
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-11-10
+
 ### Routing policy v1.6
 Field data from 14 days of real transcripts (24 sessions, 158 agent runs) showed four problems:
 - 28 runs had one agent working across 2+ repos or 3+ areas, and one of them grew from 54k to 207k context.
