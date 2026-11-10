@@ -3,5 +3,8 @@
   "version": "1.5.0",
   "description": "Five-tier agent team (scout, routine-worker, senior-engineer, debugger, architect) with model and effort matched to task difficulty, plus a routing policy that makes the main session delegate to them by default.",
   "author": { "name": "Kartikey Mishra" },
+  "homepage": "https://github.com/KartikeyMish/claude-cockpit",
+  "repository": "https://github.com/KartikeyMish/claude-cockpit",
+  "license": "MIT",
   "keywords": ["orchestration", "subagents", "routing", "effort", "productivity"]
 }

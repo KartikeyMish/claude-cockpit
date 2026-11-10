@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main, stable]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple's /usr/bin/python3 (3.9): what `ccx` runs on after `brew install` when no other python3 is installed.
+          - os: macos-latest
+            python: system
+          - os: macos-latest
+            python: "3.x"
+          # setup-python has no 3.9 build for macOS on Apple silicon, so the exact minimum is pinned here.
+          - os: ubuntu-24.04
+            python: "3.9"
+          - os: ubuntu-latest
+            python: "3.x"
+    env:
+      PYTHON: ${{ matrix.python == 'system' && '/usr/bin/python3' || 'python' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: matrix.python != 'system'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Interpreter
+        run: |
+          "$PYTHON" -c 'import sys; print(sys.executable, sys.version)'
+          "$PYTHON" bin/ccx --version
+      - name: Byte-compile every Python file
+        run: make compile
+      - name: Tests
+        run: make test
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          make lint
+
+  validate:
+    name: claude plugin validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The npm package declares node >= 22; don't depend on the runner image's default.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      # Pinned so a new validator rule shows up as a deliberate bump, not a red main.
+      # Validation needs no login (checked with an empty HOME and no API key).
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.321
+      - name: Validate plugin and marketplace
+        run: |
+          make validate
+          claude plugin validate plugins/orchestrator --profile directory

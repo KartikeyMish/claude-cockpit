@@ -78,6 +78,10 @@ def prompt_tokens(usage: dict) -> int:
     return _num(usage, "input_tokens") + _num(usage, "cache_creation_input_tokens") + _num(usage, "cache_read_input_tokens")
 
 
+def output_tokens(usage: dict) -> int:
+    return _num(usage, "output_tokens")
+
+
 def request_cost(model: str, usage: object) -> float | None:
     """USD for one API response's usage block; None for unknown models."""
     if not isinstance(usage, dict):
@@ -103,6 +107,30 @@ def request_cost(model: str, usage: object) -> float | None:
     return total
 
 
+RATE_CATEGORIES = ("input", "write_5m", "write_1h", "read", "output")
+
+
+def rate(model: str, category: str, *, speed: object = None, geo: object = None, prompt: int = 0) -> float | None:
+    """USD per single token of one category, with the same tier and multipliers as request_cost.
+
+    `prompt` is the prompt size of the request the token belongs to (it picks the
+    Haiku 5.5 long-prompt tier). None for unknown models.
+    """
+    if category not in RATE_CATEGORIES:
+        raise ValueError(f"unknown token category: {category}")
+    price = price_for(model)
+    if price is None:
+        return None
+    if (model or "").lower().startswith("claude-haiku-5-5") and prompt > HAIKU_55_TIER_TOKENS:
+        price = HAIKU_55_LONG
+    value = getattr(price, category) / MTOK
+    if speed == "fast":
+        value *= price.fast_multiplier
+    if geo == "us":
+        value *= US_ONLY_MULTIPLIER
+    return value
+
+
 def context_window(model: str, observed_tokens: int = 0) -> int:
     model = (model or "").lower()
     small = model.startswith(SMALL_WINDOW_PREFIXES) or model in SMALL_WINDOW_EXACT or any(
@@ -125,3 +153,13 @@ def fmt_usd(amount: float | None) -> str:
     if amount < 0.01:
         return "<$0.01"
     return f"${amount:,.0f}" if amount >= 100 else f"${amount:.2f}"
+
+
+def fmt_money(amount: float) -> str:
+    """fmt_usd with a leading minus for negatives: "$1.20", "−$0.41"."""
+    return ("−" if amount < 0 else "") + fmt_usd(abs(amount))
+
+
+def fmt_signed_usd(amount: float) -> str:
+    """Always signed, for savings: "+$1.20", "−$0.41", "$0"."""
+    return fmt_usd(0) if amount == 0 else ("+" if amount > 0 else "") + fmt_money(amount)

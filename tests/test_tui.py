@@ -21,6 +21,25 @@ NOW = 10_000_000_000
 HOUR_MS = 3600 * 1000
 
 
+def utf8_locale():
+    """A UTF-8 locale this machine has: en_US.UTF-8 isn't generated on every Linux."""
+    import locale
+    saved = locale.setlocale(locale.LC_ALL)
+    try:
+        for name in ("en_US.UTF-8", "C.UTF-8", "C.utf8"):
+            try:
+                locale.setlocale(locale.LC_ALL, name)
+                return name
+            except locale.Error:
+                continue
+        return "C.UTF-8"
+    finally:
+        locale.setlocale(locale.LC_ALL, saved)
+
+
+UTF8 = utf8_locale()
+
+
 def session(pid, status="idle", idle_h=1.0, sdk=False, kb=1024 * 200):
     return Session(pid=pid, name=f"s{pid}", status=status, entrypoint="sdk-ts" if sdk else "cli",
                    cwd="/tmp", status_updated_ms=int(NOW - idle_h * HOUR_MS), rss_kb=kb, tree_rss_kb=kb)
@@ -143,7 +162,7 @@ class DashboardSmokeTests(unittest.TestCase):
 
         pid, fd = pty.fork()
         if pid == 0:
-            os.environ.update(TERM="xterm-256color", LANG="en_US.UTF-8", LC_ALL="en_US.UTF-8")
+            os.environ.update(TERM="xterm-256color", LANG=UTF8, LC_ALL=UTF8)
             os.execv(sys.executable, [sys.executable, str(ROOT / "bin" / "ccx")])
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         os.kill(pid, signal.SIGWINCH)

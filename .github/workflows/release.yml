@@ -1,0 +1,60 @@
+name: Release
+
+# `make release` pushes a vX.Y.Z tag; this builds the tarball and publishes the
+# GitHub Release that the Homebrew cask downloads.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-latest
+    env:
+      TAG: ${{ github.ref_name }}
+      PYTHON: python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # full history and origin/main, for the ancestry check below
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.x"
+      # Validates the tag's format before it is used in any path below, and refuses
+      # a tag on a commit that never reached main (only main is ever released).
+      - name: Tag is on main, matches every version field and has CHANGELOG notes
+        run: |
+          python scripts/release.py verify-tag "$TAG"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$TAG ($GITHUB_SHA) is not on main; release tags must point at a commit on main"
+            exit 1
+          fi
+          echo "$TAG is on main"
+      - name: Tests
+        run: make compile test
+      - name: Build tarball and checksum
+        run: |
+          name="claude-cockpit-${TAG#v}"
+          mkdir dist
+          git archive --format=tar.gz --prefix="$name/" -o "dist/$name.tar.gz" HEAD
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          cat "dist/$name.tar.gz.sha256"
+          # The cask links this path; tiers.py also needs the repo layout kept intact.
+          tar -tzf "dist/$name.tar.gz" | grep -qx "$name/bin/ccx"
+          tar -tzf "dist/$name.tar.gz" | grep -qx "$name/plugins/orchestrator/agents/scout.md"
+      - name: Release notes
+        run: python scripts/release.py notes "${TAG#v}" > dist/notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="claude-cockpit-${TAG#v}"
+          gh release create "$TAG" "dist/$name.tar.gz" "dist/$name.tar.gz.sha256" \
+            --verify-tag --title "$TAG" --notes-file dist/notes.md

@@ -1,6 +1,7 @@
 """Team view: the agents inside one Claude session, working together, live.
 
   ◆ orchestrator   opus · xhigh   3 agents · 2 running · ctx 142k
+    saved ≈$4.10 (38%) · mix $0.90 · ctx $3.50 · overhead −$0.30 · 210k kept out of main
   ├─ ⠼ ◇ scout      Map auth flow     sonnet·med   0:42  31k  2.1k  14  Grep verifyToken src/
   └─ ✓ ◆ senior-…   Add status col…   opus·high    4:12  96k  8.4k  57  done
   TIMELINE   ·········██████████▶ / ██████████······
@@ -17,7 +18,8 @@ import time
 from dataclasses import dataclass, replace
 
 from .core import human_duration
-from .pricing import context_level, fmt_usd
+from .pricing import context_level, fmt_money, fmt_usd
+from .savings import SessionSavings, session_savings
 from .team import AgentRun, Team, TeamWatcher
 from .tiers import GLYPHS
 
@@ -101,6 +103,23 @@ def timeline_window(team: Team, now_s: float) -> tuple[float, float]:
     return max(earliest, now_s - TIMELINE_MAX_SECONDS), now_s
 
 
+def savings_lines(savings: SessionSavings | None) -> list[tuple[str, str]]:
+    """Header lines (text, tone) for delegation savings; none until an agent has run."""
+    if savings is None or not savings.runs:
+        return []
+    pct = f" ({savings.pct:.0f}%)" if savings.pct is not None else ""
+    line = (f"saved ≈{fmt_money(savings.saved_usd)}{pct} · mix {fmt_money(savings.model_mix_usd)}"
+            f" · ctx {fmt_money(savings.context_usd)} · overhead −{fmt_usd(savings.overhead_usd)}"
+            f" · {fmt_tokens(max(0, savings.kept_out_tokens))} kept out of main")
+    if savings.partial:
+        line += " · partial"
+    lines = [(line, "warn" if savings.saved_usd < 0 else "ok")]
+    if savings.would_compact:
+        lines.append((f"inline, main would have reached ≈{fmt_tokens(savings.inline_peak_tokens)} of "
+                      f"{fmt_tokens(savings.window)} and compacted: treat ctx as an upper bound", "warn"))
+    return lines
+
+
 def state_mark(agent: AgentRun, now_s: float, tick: int) -> tuple[str, str]:
     state = agent.state(now_s)
     if state == "done":
@@ -120,7 +139,7 @@ class TeamScreen:
         tier, _ = agent_label(agent.agent_type)
         return f"tier:{tier}" if tier else "dim"
 
-    def draw(self, team: Team, state: TeamState, tick: int) -> None:
+    def draw(self, team: Team, state: TeamState, tick: int, savings: SessionSavings | None = None) -> None:
         v, screen = self.view, self.view.screen
         screen.erase()
         height, width = screen.getmaxyx()
@@ -133,6 +152,9 @@ class TeamScreen:
         v.put(0, x, f" › team · {self.session_name}", v.attr("accent", curses.A_BOLD))
         v.put(0, width - 10, time.strftime("%H:%M:%S"), v.attr("dim"))
         y = self._orchestrator(2, team, now_s, tick, width)
+        for text, tone in savings_lines(savings):
+            v.put(y, 4, clip(text, width - 6), v.attr(tone))
+            y += 1
         rows = team.ordered()
         y = self._agents(y + 1, rows, state, now_s, tick, width, height)
         if state.detail and rows:
@@ -263,11 +285,16 @@ class TeamScreen:
 def team_loop(screen, view, session_id: str, session_name: str, read_key, refresh_s: float = 1.0) -> str:
     """Runs until the user goes back ("back") or quits ("quit")."""
     watcher, ui, state, tick = TeamWatcher(session_id), TeamScreen(view, session_name), TeamState(), 0
-    team, fetched = watcher.snapshot(), time.monotonic()
+
+    def fetch() -> tuple[Team, SessionSavings | None]:
+        team = watcher.snapshot()
+        return team, session_savings(session_id, watcher.collect()) if team.found else None
+
+    (team, saved), fetched = fetch(), time.monotonic()
     while True:
         if time.monotonic() - fetched >= refresh_s:
-            team, fetched = watcher.snapshot(), time.monotonic()
-        ui.draw(team, state, tick)
+            (team, saved), fetched = fetch(), time.monotonic()
+        ui.draw(team, state, tick, saved)
         tick += 1
         key = read_key(screen)
         if not key or key == "KEY_RESIZE":

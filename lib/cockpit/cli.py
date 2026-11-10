@@ -5,13 +5,19 @@
   ccx run [claude args...] same, explicitly (use when your prompt is a ccx word)
   ccx wt NAME [args...]    start Claude in a new git worktree NAME
   ccx team [NAME|PID]      live view of the agents working inside a session
-  ccx ls [--all] [--json]  running Claude sessions: state, idle time, RAM
+  ccx ls [--all] [--json]  running Claude sessions: state, idle time, RAM, cost, saved
+  ccx savings [--days N] [--json]
+                           what delegating to agents saved vs doing the same work
+                           in the main session, over the last N days (default 7)
   ccx mem [--json]         RAM breakdown: terminals, sessions, helpers
   ccx gc [--idle H] [--yes] [--dry-run]
                            close sessions idle >= H hours (default 6); they stay
                            resumable with `claude --resume`
   ccx doctor               check the cockpit setup end to end
-  ccx version
+  ccx setup [--source SRC] [--no-plugin] [--no-ghostty]
+                           install or update the Claude Code plugin (release
+                           channel) and the Ghostty profile; safe to re-run
+  ccx version | --version
 """
 
 from __future__ import annotations
@@ -25,8 +31,10 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import VERSION
-from .pricing import context_level, fmt_usd
+from .pricing import context_level, fmt_signed_usd, fmt_usd
+from .savings import SessionSavings
 from .team import SessionUsage, UsageBook
+from .installer import ghostty_binary, ghostty_dir, run_setup
 from .tiers import OVERRIDE_VARS
 from .core import (
     CLAUDE_HOME, DEFAULT_IDLE_HOURS, SESSIONS_DIR, CockpitError, duplicate_of, Session, current_ms, gc_candidates,
@@ -36,8 +44,6 @@ from .core import (
 )
 
 PLUGIN_ID = "orchestrator@claude-cockpit"
-GHOSTTY_DIR = Path(os.path.expanduser(os.environ.get("XDG_CONFIG_HOME", "~/.config"))) / "ghostty"
-GHOSTTY_APP_BIN = "/Applications/Ghostty.app/Contents/MacOS/ghostty"
 NO_AUTO_NAME = {"-n", "--name", "-r", "--resume", "-c", "--continue", "-p", "--print"}
 
 
@@ -94,18 +100,34 @@ def cmd_worktree(args: list[str]) -> int:
 
 # ---------------------------------------------------------------- listing
 
-def usage_cells(usage: SessionUsage | None) -> str:
+SAVED_W = 9  # same cell as the dashboard's SAVED column
+
+
+def saved_text(savings: SessionSavings | None) -> str:
+    """Signed saving with the dashboard's markers: ~ partial, ! would have compacted inline, - no agents."""
+    if savings is None or not savings.runs:
+        return "-"
+    return (fmt_signed_usd(savings.saved_usd) + ("~" if savings.partial else "")
+            + ("!" if savings.would_compact else ""))
+
+
+def usage_cells(usage: SessionUsage | None, savings: SessionSavings | None = None) -> str:
+    saved = saved_text(savings)
+    saved_cell = f"{saved:>{SAVED_W}}"
+    if saved != "-":
+        saved_cell = color(saved_cell, "33" if savings.saved_usd < 0 else "32")
     if usage is None:
-        return f"{'-':>5} {'-':>8}"
+        return f"{'-':>5} {'-':>8} {saved_cell}"
     pct = f"{usage.pct:>4.0f}%"
     level = context_level(usage.pct)
     if level != "ok":
         pct = color(pct, "31" if level == "critical" else "33")
     cost = ("≥" if usage.partial else "") + fmt_usd(usage.cost_usd if usage.known else None)
-    return f"{pct} {cost:>8}"
+    return f"{pct} {cost:>8} {saved_cell}"
 
 
-def session_row(s: Session, now: int, usage: SessionUsage | None = None) -> str:
+def session_row(s: Session, now: int, usage: SessionUsage | None = None,
+                savings: SessionSavings | None = None) -> str:
     state = s.status or "?"
     state_txt = color(f"{state:<7}", {"busy": "32", "waiting": "1;33"}.get(state, "2"))
     idle = s.idle_seconds(now)
@@ -114,26 +136,47 @@ def session_row(s: Session, now: int, usage: SessionUsage | None = None) -> str:
         idle_txt = color(idle_txt, "33")
     name = (s.name + (" [sdk]" if s.is_sdk else ""))[:28]
     return (f"{s.pid:>7}  {state_txt} {idle_txt} {human_mb(s.rss_kb):>8} "
-            f"{human_mb(s.tree_rss_kb):>8} {usage_cells(usage)}  {name:<28} {short_path(s.cwd)}")
+            f"{human_mb(s.tree_rss_kb):>8} {usage_cells(usage, savings)}  {name:<28} {short_path(s.cwd)}")
 
 
-def render_sessions(sessions: list[Session], now: int, usage: dict[int, SessionUsage] | None = None) -> None:
-    usage = usage or {}
-    print(color(f"{'PID':>7}  {'STATE':<7} {'IDLE':>7} {'RAM':>8} {'+KIDS':>8} {'CTX':>5} {'COST':>8}  "
-                f"{'NAME':<28} CWD", "1"))
+SESSIONS_HEADER = (f"{'PID':>7}  {'STATE':<7} {'IDLE':>7} {'RAM':>8} {'+KIDS':>8} {'CTX':>5} {'COST':>8} "
+                   f"{'SAVED':>{SAVED_W}}  {'NAME':<28} CWD")
+
+
+def render_sessions(sessions: list[Session], now: int, usage: dict[int, SessionUsage] | None = None,
+                    savings: dict[int, SessionSavings] | None = None) -> None:
+    usage, savings = usage or {}, savings or {}
+    print(color(SESSIONS_HEADER, "1"))
     dupes = duplicate_of(sessions)
     for s in sorted(sessions, key=lambda x: x.idle_seconds(now) or -1, reverse=True):
         note = color(f"  ⧉ same chat as {dupes[s.pid]}", "33") if s.pid in dupes else ""
-        print(session_row(s, now, usage.get(s.pid)) + note)
+        print(session_row(s, now, usage.get(s.pid), savings.get(s.pid)) + note)
 
 
-def usage_by_pid(sessions: list[Session]) -> dict[int, SessionUsage]:
-    book, found = UsageBook(), {}
+def usage_by_pid(sessions: list[Session], book: UsageBook | None = None) -> dict[int, SessionUsage]:
+    book, found = book or UsageBook(), {}
     for s in sessions:
         usage = book.usage(s.session_id) if s.session_id else None
         if usage:
             found[s.pid] = usage
     return found
+
+
+def savings_by_pid(sessions: list[Session], book: UsageBook) -> dict[int, SessionSavings]:
+    found = {}
+    for s in sessions:
+        saved = book.savings(s.session_id) if s.session_id else None
+        if saved:
+            found[s.pid] = saved
+    return found
+
+
+def savings_json(savings: SessionSavings | None) -> dict:
+    """`ccx ls --json` fields; saved_usd is None when there is no transcript, 0.0 without agents."""
+    if savings is None:
+        return {"saved_usd": None, "saved_partial": False, "would_compact": False}
+    return {"saved_usd": round(savings.saved_usd, 6), "saved_partial": savings.partial,
+            "would_compact": savings.would_compact}
 
 
 def check_flags(args: list[str], allowed: set[str], command: str) -> None:
@@ -148,22 +191,52 @@ def cmd_ls(args: list[str]) -> int:
     sessions = load_sessions(SESSIONS_DIR, read_processes(), now)
     if "--all" not in args:
         sessions = [s for s in sessions if not s.is_sdk]
-    usage = usage_by_pid(sessions)
+    book = UsageBook()
+    usage, savings = usage_by_pid(sessions, book), savings_by_pid(sessions, book)
     if "--json" in args:
         rows = [dict(asdict(s), idle_seconds=s.idle_seconds(now), is_sdk=s.is_sdk,
-                     usage=(dict(asdict(usage[s.pid]), pct=round(usage[s.pid].pct, 1)) if s.pid in usage else None))
+                     usage=(dict(asdict(usage[s.pid]), pct=round(usage[s.pid].pct, 1)) if s.pid in usage else None),
+                     **savings_json(savings.get(s.pid)))
                 for s in sessions]
         print(json.dumps(rows, indent=2))
         return 0
     if not sessions:
         print("No running Claude sessions found." + ("" if "--all" in args else " (try --all)"))
         return 0
-    render_sessions(sessions, now, usage)
+    render_sessions(sessions, now, usage, savings)
     total = sum(s.tree_rss_kb for s in sessions)
     dupes = duplicate_of(sessions)
     spend = sum(u.cost_usd for pid, u in usage.items() if pid not in dupes)
     print(color(f"\n{len(sessions)} sessions · {human_mb(total)} incl. child processes · "
                 f"≈{fmt_usd(spend)} API-equivalent spend", "2"))
+    return 0
+
+
+def parse_savings_args(args: list[str]) -> tuple[float, bool]:
+    """(days, as_json) from `ccx savings [--days N] [--json]`; raises CockpitError like the other commands."""
+    days, as_json, rest = 7.0, False, list(args)
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--json":
+            as_json = True
+        elif arg == "--days" or arg.startswith("--days="):
+            value = arg.split("=", 1)[1] if "=" in arg else (rest.pop(0) if rest else "")
+            try:
+                days = float(value)
+            except ValueError:
+                days = 0.0
+            if not days > 0 or days == float("inf"):
+                raise CockpitError(f"ccx savings: --days needs a positive number of days, got {value!r}")
+        else:
+            raise CockpitError(f"ccx savings: unknown option {arg!r} (allowed: --days N, --json)")
+    return days, as_json
+
+
+def cmd_savings(args: list[str]) -> int:
+    days, as_json = parse_savings_args(args)
+    from .savings_report import build_report, render_text, report_json
+    report = build_report(days=days)
+    print(json.dumps(report_json(report), indent=2) if as_json else render_text(report), end="\n" if as_json else "")
     return 0
 
 
@@ -307,7 +380,7 @@ def doctor_plugin() -> bool:
     if entry is None:
         return check(None, "orchestrator plugin", "could not read `claude plugin list --json`")
     if not entry:
-        return check(False, "orchestrator plugin installed", "run ./install.sh")
+        return check(False, "orchestrator plugin installed", "run: ccx setup")
     if not entry.get("enabled"):
         return check(False, "orchestrator plugin enabled", f"claude plugin enable {PLUGIN_ID}")
     root = entry.get("installPath")
@@ -321,10 +394,6 @@ def doctor_routing() -> bool:
                  f"routing policy injection: {mode}", "unset COCKPIT_ROUTING to re-enable")
 
 
-def ghostty_binary() -> str | None:
-    return shutil.which("ghostty") or (GHOSTTY_APP_BIN if Path(GHOSTTY_APP_BIN).exists() else None)
-
-
 def doctor_terminal() -> bool:
     term = os.environ.get("TERM_PROGRAM", "unknown")
     in_tmux = bool(os.environ.get("TMUX"))
@@ -332,8 +401,8 @@ def doctor_terminal() -> bool:
                "tmux needs allow-passthrough + extended-keys; see README")
     ghostty = ghostty_binary()
     if not ghostty:
-        return check(None, "Ghostty installed", "./install.sh --with-ghostty") and ok
-    check((GHOSTTY_DIR / "cockpit.conf").exists(), "Ghostty cockpit profile", "./install.sh --with-ghostty")
+        return check(None, "Ghostty installed", "brew install --cask ghostty, then: ccx setup") and ok
+    check((ghostty_dir() / "cockpit.conf").exists(), "Ghostty cockpit profile", "run: ccx setup")
     out = run_quiet([ghostty, "+validate-config"], 20)
     detail = " | ".join(((out.stdout + out.stderr).strip().splitlines() if out else ["no answer"])[:3])
     return check(bool(out and out.returncode == 0), "Ghostty config valid", detail) and ok
@@ -424,7 +493,7 @@ def cmd_team(args: list[str]) -> int:
 
 COMMANDS = {
     "ls": cmd_ls, "mem": cmd_mem, "gc": cmd_gc, "doctor": cmd_doctor, "wt": cmd_worktree,
-    "run": cmd_launch, "ui": cmd_dashboard, "team": cmd_team,
+    "run": cmd_launch, "ui": cmd_dashboard, "team": cmd_team, "setup": run_setup, "savings": cmd_savings,
 }
 
 

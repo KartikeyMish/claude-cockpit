@@ -15,7 +15,8 @@ import time
 from dataclasses import dataclass, field, replace
 
 from . import VERSION
-from .pricing import context_level, fmt_usd
+from .pricing import context_level, fmt_signed_usd, fmt_usd
+from .savings import SessionSavings
 from .team import SessionUsage, UsageBook
 from .tiers import COLOURS, load_tiers
 from .core import (
@@ -30,6 +31,11 @@ STALE_SECONDS = parse_hours(DEFAULT_IDLE_HOURS)
 WORKTREE_NAME = re.compile(r"[A-Za-z0-9._/-]")
 BAR_EIGHTHS = " ▏▎▍▌▋▊▉█"
 PULSE = "◐◓◑◒"
+
+# Session row: everything except NAME and DIR takes ROW_FIXED columns (incl. the SAVED cell).
+ROW_FIXED = 62
+SAVED_W = 9
+MIN_DIR_W = 8
 
 KEYS_MAIN = (("⏎", "claude here"), ("v", "team"), ("w", "worktree"), ("x", "close"), ("g", "clean idle"),
              ("a", "background"), ("t", "tiers"), ("d", "doctor"), ("q", "quit"))
@@ -57,6 +63,7 @@ class Snapshot:
     system_kb: int | None = None
     error: str = ""
     usage: dict[int, SessionUsage] = field(default_factory=dict)   # pid -> context + spend
+    savings: dict[int, SessionSavings] = field(default_factory=dict)  # pid -> delegation savings
 
     @property
     def claude_kb(self) -> int:
@@ -195,6 +202,30 @@ def fit(text: str, width: int) -> str:
     return text if len(text) <= width else text[: max(0, width - 1)] + "…"
 
 
+def session_columns(width: int) -> tuple[int, int]:
+    """(NAME width, DIR width) for the session table. DIR is dropped (0) when the terminal
+    is too narrow for every column, so the row never wraps (an 80-column window has no DIR)."""
+    name_w = max(16, min(28, width - 84))
+    if ROW_FIXED + name_w + MIN_DIR_W + 1 > width:
+        return name_w, 0
+    return name_w, max(MIN_DIR_W, width - name_w - ROW_FIXED - 21)  # 21: room for "◀ you" notes
+
+
+def sessions_header(name_w: int, dir_w: int) -> str:
+    directory = f"{'DIR':<{dir_w}} " if dir_w else ""
+    return (f"   {'NAME':<{name_w}} {directory}{'STATE':<7} {'IDLE':>7} {'RAM':>8}  "
+            f"{'CONTEXT':<11} {'COST':>8} {'SAVED':>{SAVED_W}}")
+
+
+def saved_cell(savings: SessionSavings | None) -> tuple[str, str]:
+    """Signed delegation saving and its colour; ~ = partial (unknown model or truncated
+    transcript), ! = the inline estimate would have overflowed the context window."""
+    if savings is None or not savings.runs:
+        return "-", "dim"
+    text = fmt_signed_usd(savings.saved_usd) + ("~" if savings.partial else "") + ("!" if savings.would_compact else "")
+    return text, "warn" if savings.saved_usd < 0 else "ok"
+
+
 def state_glyph(session: Session, now: int, tick: int) -> tuple[str, str]:
     if session.status == "waiting":
         return ("◉" if tick % 2 else "○"), "warn"   # blocked on the user: blink
@@ -216,15 +247,19 @@ def take_snapshot(book: UsageBook | None = None) -> Snapshot:
     now = current_ms()
     sessions = tuple(load_sessions(SESSIONS_DIR, procs, now))
     usage: dict[int, SessionUsage] = {}
+    savings: dict[int, SessionSavings] = {}
     if book is not None:
         for s in sessions:
             found = book.usage(s.session_id) if s.session_id else None
             if found:
                 usage[s.pid] = found
+                saved = book.savings(s.session_id)  # cached until a transcript grows
+                if saved:
+                    savings[s.pid] = saved
         book.keep_only({s.session_id for s in sessions if s.session_id})
     return Snapshot(
         sessions=sessions, now=now, protected=frozenset(protected_pids(procs)),
-        terminals=terminal_totals_kb(procs), system_kb=system_memory_kb(), usage=usage,
+        terminals=terminal_totals_kb(procs), system_kb=system_memory_kb(), usage=usage, savings=savings,
     )
 
 
@@ -363,11 +398,8 @@ class View:
         title = f"SESSIONS {len(rows)}" + (f"   +{hidden} background (a)" if hidden else "")
         self.put(y, 2, title, self.attr("accent", curses.A_BOLD))
         y += 1
-        name_w = max(16, min(28, width - 84))
-        dir_w = max(8, width - name_w - 73)
-        header = (f"   {'NAME':<{name_w}} {'DIR':<{dir_w}} {'STATE':<7} {'IDLE':>7} {'RAM':>8}  "
-                  f"{'CONTEXT':<11} {'COST':>8}")
-        self.put(y, 2, header, self.attr("dim"))
+        name_w, dir_w = session_columns(width)
+        self.put(y, 2, sessions_header(name_w, dir_w), self.attr("dim"))
         y += 1
         budget = height - y - (11 if state.show_tiers else 3)
         if not rows:
@@ -388,9 +420,10 @@ class View:
         x = self.put(y, x, glyph + " ", self.attr(tone, curses.A_BOLD))
         dupes = duplicate_of(snap.sessions)
         you = "  ◀ you" if s.pid in snap.protected else (f"  ⧉ same chat as {dupes[s.pid]}" if s.pid in dupes else "")
-        name = fit(s.name + (" [bg]" if s.is_sdk else ""), name_w - 2)
-        x = self.put(y, x, f"{name:<{name_w - 2}} ", sel | (curses.A_BOLD if selected else 0))
-        x = self.put(y, x, f"{fit(short_path(s.cwd), dir_w):<{dir_w}} ", self.attr("dim") | sel)
+        name = fit(s.name + (" [bg]" if s.is_sdk else ""), name_w - 1)  # column 6, same right edge as NAME
+        x = self.put(y, x, f"{name:<{name_w - 1}} ", sel | (curses.A_BOLD if selected else 0))
+        if dir_w:
+            x = self.put(y, x, f"{fit(short_path(s.cwd), dir_w):<{dir_w}} ", self.attr("dim") | sel)
         x = self.put(y, x, f"{(s.status or '?'):<7} ", self.attr(tone) | sel)
         x = self.put(y, x, f"{human_duration(s.idle_seconds(snap.now)):>7} ", self.attr(tone) | sel)
         x = self.put(y, x, f"{human_mb(s.tree_rss_kb):>8}  ", sel)
@@ -404,6 +437,8 @@ class View:
             x = self.put(y, x, f"{cost:>8}", sel)
         else:
             x = self.put(y, x, f"{'·' * 6}{'':>5} {'-':>8}", self.attr("dim"))
+        saved, saved_tone = saved_cell(snap.savings.get(s.pid))
+        x = self.put(y, x, f" {saved:>{SAVED_W}}", self.attr(saved_tone) | sel)
         self.put(y, x, you, self.attr("accent", curses.A_BOLD))
 
     def _tiers(self, y: int, width: int) -> int:
@@ -536,4 +571,5 @@ def run_dashboard() -> int:
     return 0  # unreachable
 
 
-__all__ = ["run_dashboard", "handle_key", "UiState", "Snapshot", "bar", "fit", "visible"]
+__all__ = ["run_dashboard", "handle_key", "UiState", "Snapshot", "bar", "fit", "visible", "saved_cell",
+           "session_columns", "sessions_header"]

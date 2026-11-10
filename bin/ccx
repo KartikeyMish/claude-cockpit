@@ -4,10 +4,18 @@
 import os
 import sys
 
-if sys.version_info < (3, 9):
-    sys.exit("ccx needs Python 3.9 or newer")
+# Keep this check parseable by any Python (no f-strings): it has to run before the
+# package, which needs 3.9, is imported. 3.9 is what macOS ships as /usr/bin/python3.
+MIN_PYTHON = (3, 9)
+if sys.version_info < MIN_PYTHON:
+    sys.exit(
+        "ccx needs Python %d.%d or newer, but %s is Python %s.\n"
+        "Put a newer python3 first on PATH (macOS: `xcode-select --install` provides one, "
+        "or `brew install python`), then run ccx again."
+        % (MIN_PYTHON[0], MIN_PYTHON[1], sys.executable or "python3", "%d.%d.%d" % tuple(sys.version_info[:3]))
+    )
 
-# Resolve through the ~/.local/bin symlink to find the repo's lib/.
+# Resolve through the ~/.local/bin or Homebrew symlink to find the bundled lib/.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
 
 from cockpit.cli import main  # noqa: E402

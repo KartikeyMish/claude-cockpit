@@ -1,5 +1,9 @@
 # claude-cockpit
 
+[![CI](https://github.com/KartikeyMish/claude-cockpit/actions/workflows/ci.yml/badge.svg)](https://github.com/KartikeyMish/claude-cockpit/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/KartikeyMish/claude-cockpit)](https://github.com/KartikeyMish/claude-cockpit/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 You ask for outcomes; Claude acts as your second brain. It owns the task, routes each piece to the right specialist, keeps track of what's in flight, and only asks when a decision is genuinely yours.
 
 Three parts, each usable on its own:
@@ -9,7 +13,7 @@ Three parts, each usable on its own:
 3. **Ghostty profile**: a low-overhead terminal tuned for Claude Code (keys, notifications, clipboard, splits, a drop-down terminal).
 
 ```
- ◆ claude-cockpit  v1.1.0                                                    17:31:20
+ ◆ claude-cockpit  v1.5.0                                                    17:31:20
 
   claude RAM ██▋·····················  1.77 GB of 16.00 GB   iTerm2 122 MB
   ⚑ 4 sessions idle ≥ 6h hold 588 MB. Press g to reclaim.
@@ -29,6 +33,93 @@ Three parts, each usable on its own:
 
   ⏎ claude here   v team   w worktree   x close   g clean idle   a background   t tiers   d doctor   q quit
 ```
+
+## Install
+
+You need [Claude Code](https://code.claude.com/docs/en/setup) 2.1.319 or newer and `python3` 3.9 or newer on your PATH (macOS ships one with the Command Line Tools; `ccx` tells you if yours is too old). `ccx` and the plugin run on macOS and Linux; the Homebrew cask and the Ghostty profile are aimed at macOS.
+
+The plugin, `ccx` and the Ghostty profile ship together as one version. The plugin comes from the release channel `KartikeyMish/claude-cockpit#stable`, a branch that only moves when a release is published, so you only ever get released versions.
+
+### Homebrew (macOS, recommended)
+
+```bash
+brew install --cask kartikeymish/tap/claude-cockpit
+ccx setup
+```
+
+The fully qualified name taps [KartikeyMish/homebrew-tap](https://github.com/KartikeyMish/homebrew-tap) and trusts only this cask. It's a cask rather than a formula, so it installs even when your Command Line Tools are out of date.
+
+`ccx setup` does the rest and is safe to run again at any time:
+- adds the `claude-cockpit` marketplace from the `#stable` channel and installs (or updates) `orchestrator@claude-cockpit` at user scope;
+- copies the Ghostty profile to `~/.config/ghostty/cockpit.conf` and includes it from your Ghostty config (your own settings below the include still win);
+- backs up any file it changes as `*.cockpit-backup-<timestamp>`.
+
+If you added the marketplace earlier from a git URL or a local path, `ccx setup` re-points that entry to `#stable` instead of removing it, because removing a marketplace also deletes its plugins' saved data. Options: `--no-plugin`, `--no-ghostty`, `--source <owner/repo#ref or path>`.
+
+Then start a new Claude session, or run `/clear` in an open one. Check everything with `ccx doctor`.
+
+### Claude Code plugin only
+
+No `ccx`, no profile, just the agents and the routing policy:
+
+```bash
+claude plugin marketplace add KartikeyMish/claude-cockpit#stable
+claude plugin install orchestrator@claude-cockpit
+```
+
+Inside Claude Code the same works as `/plugin marketplace add KartikeyMish/claude-cockpit#stable`, then `/plugin install orchestrator@claude-cockpit`.
+
+### From source
+
+```bash
+git clone https://github.com/KartikeyMish/claude-cockpit ~/claude-cockpit && cd ~/claude-cockpit
+./install.sh                 # plugin (from #stable) + ccx linked into ~/.local/bin
+./install.sh --with-ghostty  # also Ghostty (via Homebrew if missing) + the cockpit profile
+./install.sh --local         # development: use this checkout as the plugin source
+```
+
+`ccx` runs straight from the checkout, so check out a release tag (`git checkout v1.5.0`) to match the plugin from `#stable`, or use `--local` to run both from the checkout. `install.sh` runs `ccx setup` for the plugin and profile, so both install paths share one implementation.
+
+### For a whole team
+
+Commit this to a project's `.claude/settings.json`. Everyone who trusts the folder is offered the plugin, from the release channel:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "claude-cockpit": {
+      "source": { "source": "github", "repo": "KartikeyMish/claude-cockpit", "ref": "stable" }
+    }
+  },
+  "enabledPlugins": { "orchestrator@claude-cockpit": true }
+}
+```
+
+## Update
+
+| Installed with | Update with |
+|---|---|
+| Homebrew | `brew upgrade --cask claude-cockpit`, then `ccx setup` (run them as two commands; see [Troubleshooting](#troubleshooting)) |
+| Plugin only | `claude plugin marketplace update claude-cockpit`, then `claude plugin update orchestrator@claude-cockpit` |
+| Source | `git pull` (or check out the new tag), then `./install.sh` |
+
+Restart open Claude sessions to load a new plugin version (`claude plugin update` applies on restart).
+
+**Auto-update.** Claude Code doesn't auto-update third-party marketplaces by default. To turn it on, run `/plugin`, open **Marketplaces**, pick **claude-cockpit** and enable auto-update. Because `#stable` only moves at release, auto-update only ever brings released versions. `ccx` itself updates through Homebrew (or `git pull`).
+
+## Uninstall
+
+**Homebrew:**
+
+```bash
+claude plugin uninstall orchestrator@claude-cockpit
+claude plugin marketplace remove claude-cockpit   # also deletes the plugin's saved data
+brew uninstall --cask claude-cockpit              # add --zap to delete ~/.config/ghostty/cockpit.conf too
+```
+
+`ccx setup` added two lines starting with `# claude-cockpit profile` to `~/.config/ghostty/config`. The include is optional, so it is harmless once the profile is gone, but you can delete both lines.
+
+**Source:** `./uninstall.sh` removes the plugin, the marketplace, the `ccx` link and the Ghostty include line. It keeps the Ghostty app and your own configs; backups are left as `*.cockpit-backup-*`.
 
 ## The tiers
 
@@ -68,34 +159,6 @@ The guard fails open. If Python is missing or anything errors, the tool call goe
 
 **Fixed cost:** about 1.5k tokens per session (policy plus the five agent descriptions), plus about 40 tokens per prompt for the reminder. That's cached after the first request. The real cost driver is delegation itself: each agent starts a fresh context, which is why short requests cost a little more than they would inline. That's the trade for quality and a main context that stays small.
 
-## Install
-
-```bash
-git clone <this repo> ~/claude-cockpit && cd ~/claude-cockpit
-./install.sh                 # plugin + ccx
-./install.sh --with-ghostty  # also Ghostty + the cockpit profile (macOS/Homebrew)
-```
-
-Then start a new Claude session, or run `/clear` in an open one. Check everything with `ccx doctor`.
-
-**Plugin only** (no clone), from inside Claude Code:
-
-```
-/plugin marketplace add <git URL of this repo>
-/plugin install orchestrator@claude-cockpit
-```
-
-**Whole team, automatically.** Commit this to a project's `.claude/settings.json`; teammates are offered the plugin when they trust the folder:
-
-```json
-{
-  "extraKnownMarketplaces": {
-    "claude-cockpit": { "source": { "source": "git", "url": "<git URL of this repo>" } }
-  },
-  "enabledPlugins": { "orchestrator@claude-cockpit": true }
-}
-```
-
 ## Daily use
 
 Just type **`ccx`**. The cockpit opens; press `⏎` to start Claude in the current folder, or `w` to start it in a fresh git worktree. Everything else is one key, shown at the bottom of the screen.
@@ -105,7 +168,8 @@ Just type **`ccx`**. The cockpit opens; press `⏎` to start Claude in the curre
 | `ccx` | Open the interactive cockpit (falls back to `ccx ls` when piped) |
 | `ccx "fix the flaky queue test"` | Start Claude here with that prompt, named `<repo>@<branch>` |
 | `ccx wt fix-login` | Start Claude in a new git worktree, for parallel work without file clashes |
-| `ccx ls` | Running sessions: state, idle time, RAM, context %, API-equivalent cost |
+| `ccx ls` | Running sessions: state, idle time, RAM, context %, API-equivalent cost, saved by delegating |
+| `ccx savings` | What delegation saved over the last 7 days (`--days N`, `--json`); see [Measuring savings](#measuring-savings) |
 | `ccx team [name]` | Live team view of the agents inside a session |
 | `ccx mem` | RAM by terminal, interactive sessions, SDK/background sessions |
 | `ccx gc` | Close sessions idle ≥ 6h after confirming (`--idle 2`, `--dry-run`, `--yes`). They stay resumable with `claude --resume` |
@@ -154,11 +218,44 @@ For matching colours everywhere, run `/theme` and pick **Cockpit**.
 
 Effort scales token use. `scout` is the cheapest way to gather context. `architect` at max effort is the most expensive call in the set, so the orchestrator only runs it when you ask for a design decision or plan; otherwise it suggests it in one line. The main session does all the routing, so it doesn't need max effort itself: `high` is a good default for it.
 
+### Measuring savings
+
+Delegating isn't free: every agent starts a fresh context, and its brief and report pass through the main session. So the cockpit estimates, from transcripts already on disk, whether each session's agents saved money compared with the main session doing the same work itself.
+
+- **`SAVED` column** (dashboard and `ccx ls`): the net estimate for that session so far.
+- **Team view:** `saved ≈$X (Y%) · mix · ctx · overhead −$… · Nk kept out of main`, plus a warning line when the inline version would have overflowed the context window.
+- **`ccx savings [--days N] [--json]`:** totals across every session from the last N days (default 7). It prints two lines, one with and one without the sessions that would have compacted, and then the top sessions.
+
+| Marker | Meaning |
+|---|---|
+| `+$1.20` / `−$0.40` | Delegation saved / cost that much (it can be negative, and is reported as such) |
+| `~` | Partial: an unknown model or a transcript too large to read whole; those runs are left out |
+| `!` | Done inline, main would have outgrown its context window; treat the saving as an upper bound |
+| `-` | No agents in this session yet |
+
+**The counterfactual** is the same work done inline by the main session's model. For each agent run:
+
+- **Model mix:** the agent's own API calls, token for token, repriced at the main model's rates. Positive when a cheaper tier did the work (a Sonnet scout under an Opus main).
+- **Context:** this has two parts. *Work in context*: inline, every one of those calls would also have re-read the main session's whole context, not just the agent's small starting one. *Carry*: what the agent read and wrote would then stay in main, where every later main call re-reads it. Delegation leaves only the report behind. Carry stops at main's next compaction.
+- **Delegation overhead** (subtracted): writing the brief; the brief, launch notice and report entering main's cache; and any main turn that exists only to react to an agent (waking up for a report, or acknowledging a background launch).
+
+Sizes that aren't logged as tokens (brief, launch notice, report) are estimated at 2.5 characters per token. On real hand-backs the main prompt grew by one token per about 2.75 characters (the median), so the common chars/4 rule would understate them. Nested agents count inside the run that launched them.
+
+**Choices that round against delegation:** an agent's first-call cache write is a delegation cost (inline, that context would already be cached); repriced cache writes keep the agent's 5-minute rate although the main session writes at the dearer 1-hour rate; carry is priced at the cache-read rate even where main's cache would have expired; a report that never reached main means no carry; and a nested agent's work counts only if its report to its parent is found.
+
+**Limitations:**
+- Compaction is flagged, not priced. In `!` sessions the inline version would have compacted and shed context, so their context saving is an upper bound. `ccx savings` shows totals without them for that reason.
+- Agents you stop still count their work.
+- `SendMessage` follow-ups from main to a running agent aren't counted.
+- Transcripts from Claude Code 2.1.281–2.1.300 sometimes logged only a streaming snapshot of a response's output tokens (a few tokens instead of the final count). Where a later record has the final count, it is used. Where none does, that output stays undercounted, in both the actual and the estimated costs.
+- Everything is an API-equivalent estimate from logs, not a bill.
+
+On an 80-column terminal the session table drops the `DIR` column to make room for `SAVED`; it returns at 87 columns.
+
 ## Rolling out to a team
 
-Treat it as a pilot, not a mandate:
-1. Host the repo (git) and install from the remote so everyone gets updates through `/plugin update`.
-2. Pilot with a handful of developers for two weeks alongside a control group. Compare `/usage`, or OpenTelemetry cost and token metrics, plus the outcomes people care about: PRs merged and rework.
+1. Install from the release channel (Homebrew, or the project settings above), so everyone runs the same released version and updates arrive through `ccx setup`, `/plugin update` or auto-update.
+2. Measure before and after rather than assuming a win: compare `/usage`, or OpenTelemetry cost and token metrics, alongside the outcomes people care about, such as PRs merged and rework.
 3. Run `make eval` before every change to the agents or policy. It checks that each kind of task reaches the right tier, that short lookups and edits are delegated too, that "do it yourself" stays inline, and that migrations never reach the max-effort architect.
 4. Keep opt-outs easy (above) and listen for "it delegated when it shouldn't have". `COCKPIT_START_BUDGET=1` gives the orchestrator one look before it delegates.
 
@@ -174,15 +271,47 @@ The profile avoids transparency, blur, shaders and cursor blink, and keeps the d
 ## Develop & verify
 
 ```bash
-make test       # 143 stdlib tests: agents, guards, hook, status line, pricing, context, team view, dashboard + real pty runs
-make validate   # Claude's validator on plugin + marketplace
-make lint       # shellcheck + ruff, if installed
-make eval       # routing evals (claude plugin eval), capped spend; use --ablation with-without to compare against no plugin
+./install.sh --local   # plugin and ccx both run from this checkout
+make test              # stdlib unittest suite: agents, guards, hook, status line, pricing, context, team view, dashboard, setup, release tooling + real pty runs
+make compile           # byte-compile everything (PYTHON=/usr/bin/python3 make compile checks the 3.9 floor)
+make validate          # Claude's validator on plugin + marketplace
+make lint              # shellcheck + ruff, if installed
+make eval              # routing evals (claude plugin eval), capped spend; use --ablation with-without to compare against no plugin
 ```
+
+With `--local`, the plugin loads in place from the checkout: edits take effect at the next session start or `/reload-plugins`, with no version bump. Users only see a change once it is released, because Claude Code caches plugins per version.
 
 Evals live in `plugins/orchestrator/evals/`: one case per tier on a 51-file fixture service, plus negative cases. A one-file question and a one-line edit must be delegated (and the edit must land). "Do it yourself" must stay inline, and a migration must never reach architect.
 
-When you change a tier, bump `version` in both `plugins/orchestrator/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` (a test enforces they match), then run `./install.sh` or `/plugin update`.
+CI (GitHub Actions) runs the tests on macOS with Apple's `/usr/bin/python3` and the latest Python, and on Linux with Python 3.9 and the latest, plus shellcheck and `claude plugin validate`.
+
+## Releasing
+
+Don't bump versions by hand; the release does it. Add what changed under `## [Unreleased]` in `CHANGELOG.md` as you go, then, from an up-to-date `main` with a clean tree:
+
+```bash
+make release VERSION=1.6.0 DRY_RUN=1   # rehearse: runs every check and the tests, changes nothing
+make release VERSION=1.6.0
+```
+
+`make release` (`scripts/release.py`, stdlib only):
+1. checks you are on `main`, clean and in sync with `origin/main`, that the version is higher than the current one, that `[Unreleased]` has entries, that the tag is free, that `gh` is logged in and that the tap checkout is clean;
+2. bumps the version in `plugin.json`, `marketplace.json` and `lib/cockpit/__init__.py` (and the routing-policy title for a new minor or major, so resumed sessions pick up the new policy), and turns `[Unreleased]` into `[1.6.0] - <today>`;
+3. runs `make test` and `claude plugin validate`, and puts the files back if anything fails;
+4. commits `chore: release v1.6.0` and makes an annotated tag;
+5. asks, then pushes `main` and the tag; the tag starts the Release workflow, which builds `claude-cockpit-1.6.0.tar.gz` and its `.sha256` and publishes the GitHub Release with the CHANGELOG notes;
+6. waits for that workflow and checks the Release and its assets;
+7. fast-forwards `stable` to the tag, which is when plugin users get the release;
+8. writes the new `version` and `sha256` into the Homebrew cask (checked against the tarball), then commits and pushes the tap. The tap checkout is `~/homebrew-tap` unless you set `TAP_DIR`.
+
+Options (combine as needed):
+- `DRY_RUN=1` prints the plan and changes nothing.
+- `YES=1` pushes without asking; required when not running in a terminal.
+- `NO_TAP=1` skips the Homebrew tap update.
+
+If it stops before the push, the bumped files are put back, or, once committed, it prints the exact undo command. If it stops after the tag is pushed, `make release-finish VERSION=1.6.0` does what is left (waits for or checks the Release, fast-forwards `stable`, updates the tap) and skips steps already done, so it is safe to re-run.
+
+`python3 scripts/release.py notes 1.6.0` prints one version's notes.
 
 ## Troubleshooting
 
@@ -190,10 +319,8 @@ When you change a tier, bump `version` in both `plugins/orchestrator/.claude-plu
 - **Inside tmux:** add `set -g allow-passthrough on`, `set -g focus-events on`, `set -s extended-keys on` and `set -as terminal-features 'xterm*:extkeys'` to `~/.tmux.conf` for Shift+Enter and notifications.
 - **No notifications:** allow Ghostty under macOS System Settings → Notifications.
 - **Drop-down terminal does nothing:** grant Ghostty Accessibility permission (System Settings → Privacy & Security).
-
-## Uninstall
-
-`./uninstall.sh` removes the plugin, the marketplace, the `ccx` link and the Ghostty include line. It keeps the Ghostty app and your own configs; backups are left as `*.cockpit-backup-*`.
+- **`ccx` says it needs Python 3.9:** put a newer `python3` first on PATH: `xcode-select --install` provides one on macOS, or `brew install python`.
+- **`brew upgrade` ends with "Your Command Line Tools are too outdated":** after upgrading casks, Homebrew may also try to rebuild `pkgconf` from source ("due to macOS version mismatch"), and that part needs current Command Line Tools. claude-cockpit itself is a cask and has already upgraded (check with `ccx --version`), but `brew upgrade` exits with an error, so run `ccx setup` as its own command.
 
 ## Layout
 
@@ -203,10 +330,17 @@ plugins/orchestrator/
   .claude-plugin/plugin.json, icon.png
   agents/                              the five tiers
   hooks/hooks.json, session-start.sh   SessionStart → inject routing-policy.md
+  hooks/guard.py                       delegation guard (UserPromptSubmit + PreToolUse)
   evals/                               routing evals
   settings.json, scripts/              live subagent status rows
   themes/cockpit.json                  Claude Code colour theme
-bin/ccx, lib/cockpit/                  cockpit: core rules, cli, curses dashboard (Python 3.9+, stdlib)
+bin/ccx, lib/cockpit/                  cockpit: core rules, cli, curses dashboard, `ccx setup` (installer.py); Python 3.9+, stdlib
 terminal/ghostty/cockpit.conf          Ghostty profile
-install.sh, uninstall.sh, Makefile, tests/
+scripts/release.py                     `make release`
+.github/workflows/                     CI and the Release workflow
+install.sh, uninstall.sh, Makefile, tests/, CHANGELOG.md
 ```
+
+## License
+
+[MIT](LICENSE) © 2026 Kartikey Mishra

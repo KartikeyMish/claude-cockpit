@@ -91,6 +91,32 @@ class DedupeTests(unittest.TestCase):
         self.assertAlmostEqual(acc.cost_usd, 0.40)
         self.assertAlmostEqual(acc.last_turn_usd, 0.20)
 
+    def test_streaming_snapshot_then_final_count_uses_the_final_output(self):
+        # Claude Code 2.1.281-2.1.300 sometimes logged a streaming-start record
+        # (stop_reason null, output_tokens 8) before the final one (output 1960)
+        # under the same message id. The first record must not win.
+        snap = {"input_tokens": 0, "cache_read_input_tokens": M, "output_tokens": 8}
+        final = {"input_tokens": 0, "cache_read_input_tokens": M, "output_tokens": 1960}
+        acc = Accumulator()
+        acc.feed(record("msg_1", {"type": "thinking", "thinking": "…"}, snap), "a")
+        acc.feed(record("msg_1", {"type": "text", "text": "report"}, final), "a")
+        acc.feed(record("msg_1", {"type": "text", "text": "dup"}, snap), "a")  # a smaller late copy never lowers it
+        self.assertEqual(acc.output_tokens, 1960)
+        self.assertAlmostEqual(acc.cost_usd, 0.20 + 1960 * 20 / M)
+        self.assertAlmostEqual(acc.last_turn_usd, acc.cost_usd)
+        self.assertEqual(len(acc.calls), 1)
+        self.assertEqual(acc.calls[0].output, 1960)
+
+    def test_final_count_for_an_older_response_does_not_move_last_turn(self):
+        acc = Accumulator()
+        acc.feed(record("a", {"type": "text", "text": "x"}, {"input_tokens": 0, "cache_read_input_tokens": M,
+                                                            "output_tokens": 1}), "m")
+        acc.feed(record("b", {"type": "text", "text": "y"}), "m")
+        acc.feed(record("a", {"type": "text", "text": "x"}, {"input_tokens": 0, "cache_read_input_tokens": M,
+                                                            "output_tokens": 1001}), "m")
+        self.assertAlmostEqual(acc.cost_usd, 0.40 + 1001 * 20 / M)
+        self.assertAlmostEqual(acc.last_turn_usd, 0.20)
+
     def test_synthetic_messages_do_not_change_model_or_cost(self):
         acc = Accumulator()
         acc.feed(record("a", {"type": "text", "text": "x"}), "main")
