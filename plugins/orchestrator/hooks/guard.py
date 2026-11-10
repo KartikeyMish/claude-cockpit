@@ -15,8 +15,14 @@ PreToolUse (main thread only)
       denied until an agent has been launched for the current prompt
       (COCKPIT_START_BUDGET, default 0). After each Agent launch a few are allowed
       for checking results (COCKPIT_VERIFY_BUDGET, default 3).
-    * Never limited: shell commands made only of git/gh (plus cd/export and read-only pipe
-      filters such as `| head`), reads under ~/.claude or Claude's temp dir (agent output),
+    * Builds, tests, deploys and remote shells (make, npm, pytest, docker, aws, ssh, ...)
+      are work, never checks: denied whatever the budget.
+    * Built-in Explore / general-purpose agents (a missing subagent_type runs general-purpose)
+      bypass the tiers: the first such launch per prompt, and the rest of its parallel batch
+      (NUDGE_BATCH_S), is denied with the tier to use and doesn't count as delegating. A later
+      retry in the same prompt goes through, for when no tier fits. Other types are never touched.
+    * Never limited: shell commands made only of git/gh and `make release`/`release-finish`
+      (state the main thread owns), plus cd/export and read-only pipe filters such as `| head`, reads under ~/.claude or Claude's temp dir (agent output),
       and every other tool (Agent, MCP tools, AskUserQuestion, ...).
     * Calls without ``prompt_id`` (older Claude Code) are never limited: those versions may
       not mark subagent calls with ``agent_id`` either, and blocking an agent would be worse.
@@ -60,7 +66,19 @@ FREE_COMMANDS = frozenset({"git", "gh"})
 NEUTRAL_COMMANDS = frozenset({"cd", "pushd", "popd", "export", "true", ":"})
 PIPE_FILTERS = frozenset({"head", "tail", "grep", "egrep", "fgrep", "rg", "wc", "sort", "uniq", "cut",
                           "cat", "tr", "column", "jq", "less", "more", "sed", "awk"})
-WRAPPERS = frozenset({"env", "command"})
+# Words that run the next word as the command; their own options are skipped too.
+WRAPPERS = frozenset({"env", "command", "time", "timeout", "nice"})
+WRAPPER_ARG_OPTIONS = {  # options that take a separate argument: `env -u NAME`, `timeout -k 5`, `nice -n 10`
+    "env": frozenset({"-u", "--unset", "-C", "--chdir"}),
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+}
+# Work even inside the post-launch check window: builds, test runs, deploys, remote shells.
+# Known misses, not chased: commands run through `bash -c`/`sh -c`, `xargs`, `sudo` or `eval`, and
+# inside control flow (`for ...; do make test; done`). The normal check budget still limits those.
+HEAVY_COMMANDS = frozenset({"make", "npm", "pnpm", "yarn", "npx", "pytest", "tox", "cargo", "gradle", "mvn",
+                            "terraform", "kubectl", "docker", "helm", "aws", "ssh", "scp"})
+RELEASE_TARGETS = frozenset({"release", "release-finish"})  # main owns release/git state
 SEPARATOR_CHARS = frozenset(";&|()\n")
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 FD_REDIRECT = re.compile(r"\d*[<>]&-?\d*|&>>?")
@@ -98,6 +116,28 @@ START_REASON = ("claude-cockpit: open this request with an agent instead of work
                 f"Launch {TIERS_HINT}; several at once when independent. git and gh stay with you.")
 VERIFY_REASON = ("claude-cockpit: you've used the {limit} checks allowed after the last agent "
                  f"launch. Hand further work to an agent: {TIERS_HINT}. git and gh stay with you.")
+HEAVY_REASON = ("claude-cockpit: builds, tests, deploys and remote commands are work, not checks: brief "
+                "orchestrator:routine-worker (or orchestrator:debugger for failures) and read its output.")
+
+# Built-in agent types that bypass the tiers and inherit the main model. The first launch of
+# one per prompt (and the rest of its batch) is denied with the tier to use instead; a later
+# retry goes through (no tier fits). An Agent call without a usable subagent_type runs
+# general-purpose in Claude Code, so it is nudged as general-purpose.
+# Not listed on purpose: an explicit `fork` carries the full conversation context, which is
+# sometimes the point, and user-installed specialists (reviewers, claude-code-guide, ...) are
+# deliberate picks.
+BUILTIN_NUDGE = {
+    "Explore": "for read-only discovery launch orchestrator:scout (Sonnet) instead",
+    "general-purpose": ("launch orchestrator:routine-worker (clear spec), orchestrator:senior-engineer "
+                        "(parts interact) or orchestrator:debugger (unexplained failure) instead, or "
+                        "orchestrator:scout for read-only discovery"),
+}
+BUILTIN_REASON = ("claude-cockpit: {kind} skips the tiers and runs on the main model; {hint}. "
+                  "If no tier fits, repeat this call and it will go through.")
+# Parallel Agent calls from one assistant message reach the hook within milliseconds of each other;
+# a deliberate retry comes a model turn later. Built-ins inside this window share the first denial.
+NUDGE_BATCH_S = 2.0
+clock = time.time  # module-level so tests can substitute a fake clock
 
 State = dict
 Step = Callable[[State], "tuple[State, object]"]
@@ -149,7 +189,7 @@ class Places:
 
 def shell_segments(command: str) -> "list[tuple[bool, list[str]]] | None":
     """Split a shell command into (after_pipe, words) segments; None if it can't be tokenised."""
-    text = FD_REDIRECT.sub(" ", command)
+    text = FD_REDIRECT.sub(" ", command.replace("\\\n", " "))  # backslash-newline continues the line
     lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|()\n")
     lexer.whitespace, lexer.whitespace_split, lexer.commenters = " \t\r", True, ""
     try:
@@ -169,23 +209,66 @@ def shell_segments(command: str) -> "list[tuple[bool, list[str]]] | None":
     return segments
 
 
-def is_git_only(command: str) -> bool:
+def is_free_shell(command: str) -> bool:
+    """git/gh and `make release`/`release-finish` (state the main thread owns), with only navigation
+    and read-only pipe filters around them. Anything else in the command means normal rules."""
     segments = shell_segments(strip_heredoc_bodies(command))
     if segments is None:
         return bool(GIT_FIRST_WORD.match(command))
-    saw_git = False
+    saw_free = False
     for after_pipe, words in segments:
-        rest = list(words)
-        while rest and (ASSIGNMENT.match(rest[0]) or rest[0] in WRAPPERS):
-            rest = rest[1:]
+        rest = command_words(words)
         if not rest or rest[0].startswith("#"):
             continue
         name = os.path.basename(rest[0])
-        if name in FREE_COMMANDS:
-            saw_git = True
+        if name in FREE_COMMANDS or (name == "make" and is_release(rest)):
+            saw_free = True
         elif not (name in NEUTRAL_COMMANDS or (after_pipe and name in PIPE_FILTERS)):
             return False
-    return saw_git
+    return saw_free
+
+
+def command_words(words: "list[str]") -> "list[str]":
+    """A segment's words from the command name on: leading VAR=value, wrappers and their options dropped."""
+    rest = list(words)
+    while rest:
+        if ASSIGNMENT.match(rest[0]):
+            rest = rest[1:]
+            continue
+        name = os.path.basename(rest[0])
+        if name not in WRAPPERS:
+            break
+        rest = after_wrapper(name, rest[1:])
+    return rest
+
+
+def after_wrapper(name: str, rest: "list[str]") -> "list[str]":
+    """The words after a wrapper's own options (and timeout's duration)."""
+    if name == "command" and rest[:1] and rest[0] in {"-v", "-V"}:
+        return []  # `command -v make` looks a command up; it runs nothing
+    takes_arg = WRAPPER_ARG_OPTIONS.get(name, frozenset())
+    while rest and rest[0].startswith("-") and rest[0] != "-":
+        rest = rest[2:] if rest[0] in takes_arg else rest[1:]
+    return rest[1:] if name == "timeout" else rest
+
+
+def is_release(words: "list[str]") -> bool:
+    """`make [VAR=value ...] release|release-finish [VAR=value ...]`, and nothing else."""
+    targets = [w for w in words[1:] if not w.startswith("-") and not ASSIGNMENT.match(w)]
+    return bool(targets) and set(targets) <= RELEASE_TARGETS
+
+
+def is_heavy(command: str) -> bool:
+    """True when any segment runs a build, test, deploy or remote command (heredoc bodies are data).
+
+    A command that can't be tokenised is not called heavy; the normal budget still applies to it.
+    """
+    for _, words in shell_segments(strip_heredoc_bodies(command)) or []:
+        rest = command_words(words)
+        name = os.path.basename(rest[0]) if rest else ""
+        if name in HEAVY_COMMANDS and not (name == "make" and is_release(rest)):
+            return True
+    return False
 
 
 def strip_heredoc_bodies(command: str) -> str:
@@ -203,7 +286,7 @@ def strip_heredoc_bodies(command: str) -> str:
 
 def is_free_work(tool: str, tool_input: dict, places: Places) -> bool:
     if tool in SHELL_TOOLS:
-        return is_git_only(str(tool_input.get("command") or ""))
+        return is_free_shell(str(tool_input.get("command") or ""))
     if tool == "Read":
         return places.is_free_read(tool_input.get("file_path"))
     if tool in {"Grep", "Glob"}:
@@ -212,7 +295,7 @@ def is_free_work(tool: str, tool_input: dict, places: Places) -> bool:
 
 
 def fresh_state(prompt_id: object) -> State:
-    return {"prompt_id": prompt_id, "inline_ok": False, "delegated": False, "used": 0}
+    return {"prompt_id": prompt_id, "inline_ok": False, "delegated": False, "used": 0, "nudged_at": None}
 
 
 def current_state(state: State, prompt_id: object) -> State:
@@ -271,8 +354,9 @@ def on_prompt(payload: dict, path: str, guard_on: bool) -> "dict | None":
     prompt_id = payload.get("prompt_id")
 
     def step(old: State) -> "tuple[State, object]":
-        if notification:  # an agent reported back: work was already delegated
-            new = {**fresh_state(prompt_id), "inline_ok": bool(old.get("inline_ok")), "delegated": True}
+        if notification:  # an agent reported back: work was already delegated, same user request
+            new = {**fresh_state(prompt_id), "inline_ok": bool(old.get("inline_ok")), "delegated": True,
+                   "nudged_at": old.get("nudged_at")}
         else:
             new = {**fresh_state(prompt_id), "inline_ok": asks_for_inline(text)}
         return new, new
@@ -290,6 +374,33 @@ def deny(reason: str) -> dict:
                                    "permissionDecisionReason": reason}}
 
 
+def builtin_kind(tool_input: object) -> "tuple[str, str] | None":
+    """(BUILTIN_NUDGE key, label for the reason) when this launch runs a built-in, else None.
+    Input that isn't an object is malformed and left alone (fail open)."""
+    if not isinstance(tool_input, dict):
+        return None
+    kind = tool_input.get("subagent_type")
+    if not isinstance(kind, str) or not kind.strip():
+        return "general-purpose", "an Agent call without a subagent_type runs general-purpose, which"
+    return (kind, kind) if kind in BUILTIN_NUDGE else None
+
+
+def agent_step(prompt_id: object, builtin: "tuple[str, str] | None", now: float) -> Step:
+    """An Agent/Task launch: counts as delegation, unless it is the prompt's first built-in batch."""
+
+    def step(old: State) -> "tuple[State, object]":
+        state = current_state(old, prompt_id)
+        nudged_at = state.get("nudged_at")
+        first = not isinstance(nudged_at, (int, float)) or isinstance(nudged_at, bool)
+        if builtin and (first or 0 <= now - nudged_at < NUDGE_BATCH_S):  # denied: nothing delegated
+            key, label = builtin
+            return ({**state, "nudged_at": now if first else nudged_at},
+                    deny(BUILTIN_REASON.format(kind=label, hint=BUILTIN_NUDGE[key])))
+        return {**state, "delegated": True, "used": 0}, None
+
+    return step
+
+
 def on_tool(payload: dict, path: str, env: "os._Environ[str] | dict[str, str]") -> "dict | None":
     if payload.get("agent_id"):  # inside a subagent: that is where the work belongs
         return None
@@ -303,7 +414,7 @@ def on_tool(payload: dict, path: str, env: "os._Environ[str] | dict[str, str]") 
     places = Places(env, payload.get("cwd"))
 
     if tool in AGENT_TOOLS:
-        return with_state(path, lambda s: ({**current_state(s, prompt_id), "delegated": True, "used": 0}, None))
+        return with_state(path, agent_step(prompt_id, builtin_kind(payload.get("tool_input")), clock()))
     if tool in EDIT_TOOLS:
         if places.is_claude_home(tool_input.get("file_path") or tool_input.get("notebook_path")):
             return None
@@ -318,11 +429,14 @@ def on_tool(payload: dict, path: str, env: "os._Environ[str] | dict[str, str]") 
 
     start = budget(env, "COCKPIT_START_BUDGET", DEFAULT_START_BUDGET)
     verify = budget(env, "COCKPIT_VERIFY_BUDGET", DEFAULT_VERIFY_BUDGET)
+    heavy = tool in SHELL_TOOLS and is_heavy(str(tool_input.get("command") or ""))
 
     def step(old: State) -> "tuple[State, object]":
         state = current_state(old, prompt_id)
         if state["inline_ok"]:
             return state, None
+        if heavy:  # never a check, whatever budget is left; doesn't use any up either
+            return state, deny(HEAVY_REASON)
         limit = verify if state["delegated"] else start
         if state["used"] < limit:
             return {**state, "used": state["used"] + 1}, None

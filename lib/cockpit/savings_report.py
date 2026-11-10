@@ -10,6 +10,8 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .parallel import session_parallel
+from .parallel_report import ParallelRow, parallel_json, render_parallel
 from .pricing import fmt_money, fmt_signed_usd, fmt_usd
 from .savings import RunSavings, SessionSavings, session_savings
 from .team import PROJECTS_DIR, TeamWatcher
@@ -59,6 +61,7 @@ class Report:
     scanned: int                   # sessions active in the window, with or without agents
     total: Totals
     without_compact: Totals
+    parallel: tuple = ()           # ParallelRow per session with agents or the routing policy
 
 
 def project_label(directory: str, home: Path | None = None) -> str:
@@ -104,17 +107,22 @@ def build_report(projects_dir: Path | None = None, days: float = DEFAULT_DAYS, n
         raise ValueError("days must be a positive number")
     projects_dir = PROJECTS_DIR if projects_dir is None else projects_dir
     now = time.time() if now is None else now
-    rows, scanned = [], 0
+    rows, parallel, scanned = [], [], 0
     for path in recent_transcripts(projects_dir, days, now):
         scanned += 1
-        watcher = TeamWatcher(path.stem, projects_dir, session_dir=path.with_suffix(""))
-        savings = session_savings(path.stem, watcher.collect())
+        collected = TeamWatcher(path.stem, projects_dir, session_dir=path.with_suffix("")).collect()
+        project = project_label(path.parent.name, home)
+        savings = session_savings(path.stem, collected)
         if savings is not None and savings.runs:
-            rows.append(SessionRow(project_label(path.parent.name, home), savings))
+            rows.append(SessionRow(project, savings))
+        metrics = session_parallel(path.stem, collected)
+        if metrics is not None and (metrics.agents or metrics.policy):  # policy sessions keep the denominator honest
+            parallel.append(ParallelRow(project, metrics))
     rows.sort(key=lambda row: (-row.savings.saved_usd, row.savings.session_id))
+    parallel.sort(key=lambda row: row.parallel.session_id)
     kept = [row for row in rows if not row.savings.would_compact]
     return Report(days=days, generated=now, rows=tuple(rows), scanned=scanned,
-                  total=totals(rows), without_compact=totals(kept))
+                  total=totals(rows), without_compact=totals(kept), parallel=tuple(parallel))
 
 
 # ---------------------------------------------------------------- text
@@ -148,9 +156,10 @@ def render_text(report: Report, top: int = TOP_SESSIONS) -> str:
     days = f"{report.days:g}"
     lines = [f"Delegation savings · last {days} day{'s' if report.days != 1 else ''} · "
              f"{report.total.sessions} of {report.scanned} sessions ran agents · API-equivalent USD", ""]
+    block = render_parallel(report.parallel)
     if not report.rows:
-        return "\n".join(lines + ["No session in this window delegated to an agent, so there is nothing to compare.",
-                                  "", METHOD_NOTE]) + "\n"
+        lines += ["No session in this window delegated to an agent, so there is nothing to compare."]
+        return "\n".join(lines + ([""] + block if block else []) + ["", METHOD_NOTE]) + "\n"
     head = (f"{'':<22}{'sess':>5} {'runs':>5} {'delegated':>10} {'inline':>10} {'saved':>10} {'%':>7} "
             f"{'mix':>9} {'context':>9} {'overhead':>9} {'kept out':>8}")
     t = report.total
@@ -168,7 +177,7 @@ def render_text(report: Report, top: int = TOP_SESSIONS) -> str:
               (f"{'session':<9} {'project':<24} {'runs':>4} {'delegated':>10} {'inline':>10} {'saved':>10} "
                f"{'%':>7} {'mix':>9} {'context':>9} {'overhead':>9} {'kept out':>8}  flags")]
     lines += [_session_line(row) for row in report.rows[:top]]
-    lines += ["", METHOD_NOTE]
+    lines += ([""] + block if block else []) + ["", METHOD_NOTE]
     return "\n".join(lines) + "\n"
 
 
@@ -201,4 +210,4 @@ def report_json(report: Report) -> dict:
     return {"days": report.days, "generated": report.generated, "scanned": report.scanned,
             "totals": {"all": _totals_json(report.total),
                        "without_would_compact": _totals_json(report.without_compact)},
-            "sessions": sessions, "method": METHOD_NOTE}
+            "sessions": sessions, "parallelism": parallel_json(report.parallel), "method": METHOD_NOTE}

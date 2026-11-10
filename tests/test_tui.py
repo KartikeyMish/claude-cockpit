@@ -15,7 +15,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 
 from cockpit.core import Session  # noqa: E402
-from cockpit.tui import Snapshot, UiState, bar, fit, handle_key, state_glyph, visible  # noqa: E402
+from cockpit.tui import (  # noqa: E402
+    Snapshot, UiState, View, bar, fit, footer_hint, handle_key, name_cell, session_columns, state_glyph, visible,
+)
 
 NOW = 10_000_000_000
 HOUR_MS = 3600 * 1000
@@ -150,6 +152,64 @@ class DrawingHelperTests(unittest.TestCase):
         self.assertEqual(state_glyph(session(1, status="busy"), NOW, 0)[1], "busy")
         self.assertEqual(state_glyph(session(1, idle_h=10), NOW, 0), ("◌", "stale"))
         self.assertEqual(state_glyph(session(1, idle_h=1), NOW, 0), ("○", "idle"))
+
+
+class FakeScreen:
+    """Just enough of a curses window to render rows into a character grid."""
+
+    def __init__(self, height, width):
+        self.height, self.width = height, width
+        self.grid = [[" "] * width for _ in range(height)]
+
+    def getmaxyx(self):
+        return self.height, self.width
+
+    def addstr(self, y, x, text, _attr=0):
+        for offset, char in enumerate(text):
+            if x + offset < self.width:
+                self.grid[y][x + offset] = char
+
+    def line(self, y):
+        return "".join(self.grid[y]).rstrip()
+
+
+def render_row(s, width, hooks_stale=()):
+    view = View.__new__(View)  # skip curses colour setup: attr() falls back to plain text
+    view.screen, view.colors, view.tiers = FakeScreen(3, width), {}, []
+    snapshot = Snapshot(sessions=(s,), now=NOW, hooks_stale=frozenset(hooks_stale))
+    view._session_row(0, s, snapshot, False, 0, *session_columns(width))
+    return view.screen.line(0)
+
+
+class StaleHooksMarkerTests(unittest.TestCase):
+    def test_marker_keeps_every_column_at_80_and_120(self):
+        for width in (80, 120):
+            with self.subTest(width=width):
+                s = session(7, idle_h=2)
+                plain, marked = render_row(s, width), render_row(s, width, {7})
+                self.assertIn("s7", plain)
+                self.assertNotIn("⟳", plain)
+                self.assertIn("s7 ⟳", marked)
+                self.assertEqual(marked.count("⟳"), 1)
+                self.assertLessEqual(len(marked), width)
+                self.assertEqual(len(plain), len(marked))           # same right edge: SAVED intact
+                self.assertEqual(plain.index("idle"), marked.index("idle"))
+
+    def test_long_names_are_cut_to_make_room_for_the_marker(self):
+        name_w, _ = session_columns(80)
+        long = Session(**dict(session(7).__dict__, name="a-very-long-session-name-indeed"))
+        cell = name_cell(long, name_w, True)
+        self.assertEqual(len(cell), name_w - 1)
+        self.assertTrue(cell.endswith("… ⟳"))
+        self.assertEqual(len(name_cell(long, name_w, False)), name_w - 1)
+        self.assertIn("⟳", render_row(long, 80, {7}))
+
+    def test_footer_hint_only_while_a_listed_session_is_stale(self):
+        rows = [session(1), session(2)]
+        self.assertEqual(footer_hint(Snapshot(sessions=tuple(rows), now=NOW), rows), "")
+        hint = footer_hint(Snapshot(sessions=tuple(rows), now=NOW, hooks_stale=frozenset({2})), rows)
+        self.assertIn("restart to load current hooks: exit, then claude --resume", hint)
+        self.assertEqual(footer_hint(Snapshot(now=NOW, hooks_stale=frozenset({9})), rows), "")
 
 
 @unittest.skipUnless(sys.platform != "win32", "needs a POSIX pty")

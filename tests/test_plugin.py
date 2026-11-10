@@ -32,7 +32,7 @@ VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 VALID_COLORS = {"red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"}
 # SessionStart additionalContext is capped at 10,000 chars; stay well under it
 # because this text is paid for in every session.
-POLICY_BUDGET_CHARS = 4500
+POLICY_BUDGET_CHARS = 5000
 
 
 def parse_frontmatter(path):
@@ -143,6 +143,55 @@ class AgentDefinitionTests(unittest.TestCase):
 
     def test_policy_supersedes_earlier_versions(self):
         self.assertIn("replaces any earlier claude-cockpit routing policy", POLICY.read_text())
+
+    def test_policy_title_becomes_v1_6_at_the_next_minor_release(self):
+        # The title tracks plugin.json and `make release` bumps it, so v1.6 lands with 1.6.0.
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from release_files import bump_policy_title
+        bumped = bump_policy_title(POLICY.read_text(encoding="utf-8"), "1.6.0")
+        self.assertEqual(bumped.splitlines()[0], "# Orchestrator routing (claude-cockpit policy v1.6)")
+
+    def test_policy_splits_work_by_area_in_one_message(self):
+        policy = POLICY.read_text(encoding="utf-8")
+        for phrase in ("Split by area", "2+ repos, services or independent areas", "one agent per area",
+                       "launched in ONE message", 'isolation: "worktree"', "disjoint files",
+                       "depend on each other's results", "(≤3 tool calls)", "into an agent you're launching anyway",
+                       "2–4 parallel scouts", "search space really splits",
+                       "Launch independent steps together", "names why", "shared browser", "one git owner"):
+            self.assertIn(phrase, policy)
+
+    def test_policy_plan_template_shows_a_parallel_split(self):
+        policy = POLICY.read_text(encoding="utf-8")
+        template = policy[policy.index("Plan: <goal"):policy.index("Verify: <")]
+        self.assertRegex(template, r"\[senior-engineer\][^\n]*· \[routine-worker\][^\n]*parallel, worktree")
+
+    def test_policy_matches_the_guard_on_verification(self):
+        policy = POLICY.read_text(encoding="utf-8")
+        self.assertIn("Builds, tests, deploys and remote commands always go to an agent; "
+                      "you check by reading its output and the diff.", policy)
+
+    def test_policy_handles_split_like_escalate(self):
+        policy = POLICY.read_text(encoding="utf-8")
+        for phrase in ("`ESCALATE: <tier>`", "`SPLIT: <area> | <area>`", "launch the listed areas in parallel",
+                       "findings so far"):
+            self.assertIn(phrase, policy)
+
+    def test_policy_steers_off_builtin_agents_and_cuts_wake_ups(self):
+        policy = POLICY.read_text(encoding="utf-8")
+        for phrase in ("not built-in Explore, general-purpose or fork", "unless no tier fits",
+                       "specialist reviewer the user installed", "don't poll or narrate", "once per batch",
+                       "Mark steps ✓ in your final report, not as narration"):
+            self.assertIn(phrase, policy)
+
+    def test_every_tier_documents_split_and_no_interim_messages(self):
+        for name in EXPECTED_TIERS:
+            with self.subTest(agent=name):
+                _, body = parse_frontmatter(AGENTS / f"{name}.md")
+                self.assertIn("`SPLIT: <area B> | <area C> …`", body)
+                self.assertIn("finish the first coherent area (unless your brief assigns all areas)", body)
+                self.assertIn("`ESCALATE", body)
+                self.assertIn("Send no interim progress messages", body)
+                self.assertIn("unless you are blocked", body)
 
     def test_colors_are_distinct(self):
         colors = [parse_frontmatter(AGENTS / f"{n}.md")[0]["color"] for n in EXPECTED_TIERS]
@@ -317,6 +366,45 @@ class HookDataDirTests(unittest.TestCase):
         hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())
         command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         self.assertTrue(command.startswith("bash "), "don't depend on the exec bit surviving plugin caching")
+
+
+EVALS = PLUGIN / "evals"
+
+
+class EvalFormatTests(unittest.TestCase):
+    """Every routing eval case follows the same layout, so `make eval` loads them all."""
+
+    def cases(self):
+        return sorted(p for p in EVALS.iterdir() if p.is_dir() and p.name != "results")
+
+    def test_each_case_has_matching_name_routing_env_and_graders(self):
+        for case in self.cases():
+            with self.subTest(case=case.name):
+                yaml = (case / "case.yaml").read_text(encoding="utf-8")
+                self.assertIn('schema_version: "1.1"', yaml)
+                self.assertIn(f"name: {case.name}\n", yaml)
+                fields, body = parse_frontmatter(case / "prompt.md")
+                for key in ("description", "tags", "runs", "max_turns", "allowed_tools"):
+                    self.assertIn(key, fields)
+                self.assertIn('EVAL_COCKPIT_ROUTING: "on"', (case / "prompt.md").read_text(encoding="utf-8"))
+                self.assertTrue(body.strip())
+                graders = sorted((case / "graders").glob("*.md"))
+                self.assertTrue(graders)
+                for grader in graders:
+                    self.assertRegex(parse_frontmatter(grader)[0].get("type", ""), r"^(tool_used|regex|llm)$")
+                if "scaffold_script" in yaml:
+                    self.assertTrue((case / "scaffold.sh").is_file())
+
+    def test_parallel_split_case_checks_one_agent_per_area_and_no_builtins(self):
+        graders = {p.stem: p.read_text(encoding="utf-8") for p in (EVALS / "route-parallel-split" / "graders").glob("*.md")}
+        self.assertIn("(?=.*billing/src/format)", graders["delegates-billing"])
+        self.assertIn("(?=.*notify/src/send)", graders["delegates-notify"])
+        for name in ("delegates-billing", "delegates-notify"):
+            self.assertNotIn("(?!", graders[name], "a correct brief may name the other area")
+        self.assertIn("min: 2", graders["two-editing-agents"])
+        self.assertIn("Explore|general-purpose", graders["no-builtin-agents"])
+        self.assertIn("max: 0", graders["no-builtin-agents"])
+        self.assertIn("same assistant message", graders["launched-together"])
 
 
 @unittest.skipUnless(shutil.which("claude"), "claude CLI not installed")

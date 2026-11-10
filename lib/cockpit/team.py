@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .core import CLAUDE_HOME
+from .parallel import AGENT_TOOLS, GuardState, add_activity, code_tokens, guard_prompt, guard_verdict, release_after_launch
 from .pricing import context_window, output_tokens, prompt_tokens, request_cost
 
 PROJECTS_DIR = CLAUDE_HOME / "projects"
@@ -34,12 +35,17 @@ TIMESTAMP_RE = re.compile(rb'"timestamp":\s*"([^"]+)"')
 # compaction boundary; every other line (tool results, file snapshots) stays on the
 # cheap timestamp path.
 AUX_TYPE_RE = re.compile(rb'"type":\s*"(?:user|attachment|system)"')
-AUX_HINT_RE = re.compile(rb'<task-notification>|"kind":\s*"peer"|"compact_boundary"')
+# String-content user messages are prompts (human, notification, peer); tool results are lists.
+AUX_HINT_RE = re.compile(rb'<task-notification>|"kind":\s*"peer"|"compact_boundary"'
+                         rb'|"role":\s*"user",\s*"content":\s*"')
+POLICY_MARK = b"claude-cockpit policy v"   # the routing policy's SessionStart injection
+SESSION_START_RE = re.compile(rb'"hookEvent"\s*:\s*"SessionStart"')  # as doctor.injected_policy_version
 TOOL_RESULT_ID_RE = re.compile(rb'"tool_use_id":\s*"([^"]+)"')
 NOTIFICATION_TAG = "<task-notification>"
 TASK_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
 TASK_TOOL_USE_RE = re.compile(r"<tool-use-id>([^<]+)</tool-use-id>")
 SPAWN_TOOLS = frozenset({"Agent", "Task"})
+EDIT_TOOL_NAMES = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 FEED_SIZE = 200
 STALL_SECONDS = 300
 
@@ -155,6 +161,8 @@ class Spawn:
     ts: float | None
     call_index: int         # index into Accumulator.calls of the response that issued it (-1: none)
     brief_chars: int        # size of the tool input (the brief) as serialized JSON
+    request: int = -1       # index of the human request it belongs to (main transcript)
+    brief_tokens: frozenset = frozenset()   # code-like tokens of the brief (parallel.code_tokens)
 
 
 @dataclass(frozen=True)
@@ -166,6 +174,7 @@ class Handback:
     agent_id: str = ""
     tool_use_id: str = ""
     final: bool = True      # False for launch acks and interim peer messages
+    tokens: frozenset = frozenset()   # code-like tokens of the text (for the independence heuristic)
 
 
 # ---------------------------------------------------------------- parsing (pure)
@@ -224,15 +233,46 @@ class Accumulator:
     handbacks: list = field(default_factory=list)             # Handback, in log order
     compactions: list = field(default_factory=list)           # timestamps of compact boundaries
     seen_handbacks: set = field(default_factory=set)
+    intervals: list = field(default_factory=list)             # activity intervals (parallel.add_activity)
+    edited: set = field(default_factory=set)                  # file paths this agent edited
+    touched: set = field(default_factory=set)                 # file paths it read, searched or edited
+    handback_report: str = ""                                 # its SubagentHandback message, if any
+    policy: bool = False                                      # routing policy injected (main)
+    human_requests: int = 0
+    request_tools: list = field(default_factory=list)         # per request: tool calls in this transcript
+    request_over: list = field(default_factory=list)          # per request: calls the guard would deny
+    guard: GuardState = GuardState()
+    guard_held: list = field(default_factory=list)            # requests of start-denied calls in this response
+    guard_held_key: object = None                             # the response they belong to
+    cwd: str = ""                                             # latest record cwd (resolves relative paths)
 
     def touch(self, ts: float | None) -> None:
         if ts is not None:
             self.started = ts if self.started is None else min(self.started, ts)
             self.last_activity = ts if self.last_activity is None else max(self.last_activity, ts)
+            self.intervals = add_activity(self.intervals, ts)
+
+    def _request(self) -> int:
+        """Index of the current request; tool calls before any prompt open an implicit one."""
+        if not self.request_tools:
+            self.request_tools.append(0)
+            self.request_over.append(0)
+        return len(self.request_tools) - 1
+
+    def _prompt(self, text: str, notification: bool) -> None:
+        """A new prompt_id: the guard starts over; a human prompt also opens a new request."""
+        self._commit_held()
+        self.guard = guard_prompt(text, notification, self.guard)
+        if not notification:
+            self.human_requests += 1
+            self.request_tools.append(0)
+            self.request_over.append(0)
 
     def feed(self, record: dict, agent_id: str) -> None:
         ts = parse_ts(record.get("timestamp"))
         self.touch(ts)
+        if isinstance(record.get("cwd"), str):
+            self.cwd = record["cwd"]
         if record.get("type") != "assistant":
             self._aux(record, ts)
             return
@@ -300,18 +340,58 @@ class Accumulator:
     def _block(self, block: dict, ts: float | None, agent_id: str, index: int = -1) -> None:
         if block.get("type") == "tool_use":
             name = str(block.get("name") or "tool")
+            data = block.get("input") if isinstance(block.get("input"), dict) else {}
             summary = summarize_tool(name, block.get("input"))
             self.tool_calls += 1
             self.now = summary
+            if agent_id == "main":  # requests and the guard mirror only exist on the main thread
+                request = self._request()
+                self.request_tools[request] += 1
+                self._guard(name, data, request, index if index >= 0 else ("ts", ts))
+            else:
+                request = -1
+            self._paths(name, data)
             if name in SPAWN_TOOLS and block.get("id"):
                 tool_use_id = str(block["id"])
                 self.spawned[tool_use_id] = agent_id
-                self.spawns[tool_use_id] = Spawn(tool_use_id, ts, index, len(json.dumps(block.get("input"))))
+                self.spawns[tool_use_id] = Spawn(tool_use_id, ts, index, len(json.dumps(block.get("input"))),
+                                                 request, code_tokens(str(data.get("prompt") or "")))
+            elif name == "SubagentHandback" and isinstance(data.get("message"), str):
+                self.handback_report = data["message"]
             self.events.append(Event(ts or 0.0, agent_id, name, summary))
         elif block.get("type") == "text" and str(block.get("text") or "").strip():
             self.report = str(block["text"]).strip()
 
-    # -- non-assistant records: only hand-backs and compaction boundaries matter
+    def _guard(self, name: str, data: dict, request: int, response: object) -> None:
+        """Mirror the guard. A start-budget denial is held until its response ends: the guard re-checks
+        it after 150 ms, so an Agent call later in the same response lets it through."""
+        if self.guard_held and response != self.guard_held_key:
+            self._commit_held()
+        self.guard, reason = guard_verdict(self.guard, name, data, cwd=self.cwd)
+        if name in AGENT_TOOLS and self.guard_held:
+            self.guard, still_denied = release_after_launch(self.guard, len(self.guard_held))
+            for held in self.guard_held[len(self.guard_held) - still_denied:]:
+                self.request_over[held] += 1
+            self.guard_held = []
+        elif reason == "start":
+            self.guard_held.append(request)
+            self.guard_held_key = response
+        elif reason:
+            self.request_over[request] += 1
+
+    def _commit_held(self) -> None:
+        for held in self.guard_held:
+            self.request_over[held] += 1
+        self.guard_held = []
+
+    def _paths(self, name: str, data: dict) -> None:
+        path = data.get("file_path") or data.get("notebook_path") or data.get("path")
+        if isinstance(path, str) and path:
+            self.touched.add(path)
+            if name in EDIT_TOOL_NAMES:
+                self.edited.add(path)
+
+    # -- non-assistant records: only prompts, hand-backs and compaction boundaries matter
 
     def _aux(self, record: dict, ts: float | None) -> None:
         kind = record.get("type")
@@ -319,6 +399,9 @@ class Accumulator:
             self.compactions.append(ts)
         elif kind == "attachment":
             attachment = record.get("attachment") if isinstance(record.get("attachment"), dict) else {}
+            if attachment.get("hookEvent") == "SessionStart" and POLICY_MARK.decode() in str(
+                    attachment.get("content") or attachment.get("stdout") or ""):
+                self.policy = True
             prompt = attachment.get("prompt")
             if attachment.get("type") == "queued_command" and isinstance(prompt, str):
                 self._notification(prompt, ts)
@@ -326,7 +409,8 @@ class Accumulator:
             message = record.get("message") if isinstance(record.get("message"), dict) else {}
             content = message.get("content")
             if isinstance(content, str):
-                self._user_text(content, record.get("origin"), ts)
+                if not (record.get("isMeta") or record.get("isCompactSummary")):
+                    self._user_text(content, record.get("origin"), ts)
             elif isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "tool_result":
@@ -339,23 +423,30 @@ class Accumulator:
             self.seen_handbacks.add(key)
             self.handbacks.append(handback)
 
-    def _notification(self, text: str, ts: float | None) -> None:
+    def _notification(self, text: str, ts: float | None) -> bool:
         if not text.lstrip().startswith(NOTIFICATION_TAG):
-            return
+            return False
         task, tool_use = TASK_ID_RE.search(text), TASK_TOOL_USE_RE.search(text)
         if task is None and tool_use is None:
-            return
+            return False
         self._add_handback(Handback(ts, "notification", len(text), task.group(1).strip() if task else "",
-                                    tool_use.group(1).strip() if tool_use else ""), text)
+                                    tool_use.group(1).strip() if tool_use else "", tokens=code_tokens(text)), text)
+        return True
 
     def _user_text(self, text: str, origin: object, ts: float | None) -> None:
         origin = origin if isinstance(origin, dict) else {}
-        if origin.get("kind") == "peer":
+        kind = origin.get("kind")
+        if kind == "peer":
             sender = str(origin.get("from") or origin.get("senderTaskId") or "")
             if sender:
-                self._add_handback(Handback(ts, "peer", len(text), sender, "", bool(origin.get("handback"))), text)
+                self._add_handback(Handback(ts, "peer", len(text), sender, "", bool(origin.get("handback")),
+                                            code_tokens(text)), text)
+            self._prompt(text, notification=True)
         elif text.lstrip().startswith(NOTIFICATION_TAG):
             self._notification(text, ts)
+            self._prompt(text, notification=True)
+        elif kind in (None, "human") and not text.lstrip().startswith(("<local-command", "Caveat:")):
+            self._prompt(text, notification=False)
 
     def _tool_result(self, block: dict, result: object, ts: float | None) -> None:
         tool_use_id = str(block.get("tool_use_id") or "")
@@ -366,7 +457,8 @@ class Accumulator:
             str(b.get("text") or "") for b in content or [] if isinstance(b, dict))
         launched = result.get("status") == "async_launched"
         self._add_handback(Handback(ts, "launch" if launched else "result", len(text),
-                                    str(result.get("agentId") or ""), tool_use_id, not launched), text)
+                                    str(result.get("agentId") or ""), tool_use_id, not launched,
+                                    frozenset() if launched else code_tokens(text)), text)
 
 
 class TranscriptTail:
@@ -413,6 +505,8 @@ class TranscriptTail:
     def _aux_wanted(self, line: bytes) -> bool:
         if not AUX_TYPE_RE.search(line):
             return False
+        if not self.acc.policy and POLICY_MARK in line and SESSION_START_RE.search(line):
+            return True  # only a SessionStart hook attachment counts, never tool output quoting the policy
         if AUX_HINT_RE.search(line):
             return True
         match = TOOL_RESULT_ID_RE.search(line) if self.acc.spawns else None
@@ -532,7 +626,11 @@ class UsageBook:
     def __init__(self, projects_dir: Path = PROJECTS_DIR) -> None:
         self.projects_dir = projects_dir
         self.watchers: dict[str, TeamWatcher] = {}
-        self.saved: dict[str, tuple] = {}   # session id -> (read position, SessionSavings)
+        self.saved: dict[str, tuple] = {}       # session id -> (read position, SessionSavings)
+        self.parallels: dict[str, tuple] = {}   # session id -> (read position, SessionParallel)
+
+    def watcher(self, session_id: str) -> TeamWatcher:
+        return self._watcher(session_id)
 
     def _watcher(self, session_id: str) -> TeamWatcher:
         if session_id not in self.watchers:
@@ -542,21 +640,30 @@ class UsageBook:
     def usage(self, session_id: str) -> SessionUsage | None:
         return session_usage(self._watcher(session_id).snapshot())
 
-    def savings(self, session_id: str):  # -> savings.SessionSavings | None (imported lazily: no cycle)
-        """Recomputed only when a transcript grew since the last call (the dashboard asks often)."""
-        from .savings import session_savings
+    def _cached(self, cache: dict, session_id: str, compute):
+        """compute(session_id, collected), redone only when a transcript grew since the last call."""
         watcher = self._watcher(session_id)
         collected = watcher.collect()
         position = watcher.read_position()
-        cached = self.saved.get(session_id)
-        if cached is not None and cached[0] == position:
-            return cached[1]
-        result = session_savings(session_id, collected)
-        self.saved[session_id] = (position, result)
+        hit = cache.get(session_id)
+        if hit is not None and hit[0] == position:
+            return hit[1]
+        result = compute(session_id, collected)
+        cache[session_id] = (position, result)
         return result
+
+    def savings(self, session_id: str):  # -> savings.SessionSavings | None (imported lazily: no cycle)
+        """Recomputed only when a transcript grew since the last call (the dashboard asks often)."""
+        from .savings import session_savings
+        return self._cached(self.saved, session_id, session_savings)
+
+    def parallel(self, session_id: str):  # -> parallel.SessionParallel | None
+        from .parallel import session_parallel
+        return self._cached(self.parallels, session_id, session_parallel)
 
     def keep_only(self, session_ids: set[str]) -> None:
         for stale in set(self.watchers) - session_ids:
             del self.watchers[stale]
-        for stale in set(self.saved) - session_ids:
-            del self.saved[stale]
+        for cache in (self.saved, self.parallels):
+            for stale in set(cache) - session_ids:
+                del cache[stale]

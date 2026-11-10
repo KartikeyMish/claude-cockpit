@@ -2,6 +2,7 @@
 
   ◆ orchestrator   opus · xhigh   3 agents · 2 running · ctx 142k
     saved ≈$4.10 (38%) · mix $0.90 · ctx $3.50 · overhead −$0.30 · 210k kept out of main
+    parallel: max 3 · 41% overlap · 12m saved
   ├─ ⠼ ◇ scout      Map auth flow     sonnet·med   0:42  31k  2.1k  14  Grep verifyToken src/
   └─ ✓ ◆ senior-…   Add status col…   opus·high    4:12  96k  8.4k  57  done
   TIMELINE   ·········██████████▶ / ██████████······
@@ -19,8 +20,9 @@ from dataclasses import dataclass, replace
 
 from .core import human_duration
 from .pricing import context_level, fmt_money, fmt_usd
-from .savings import SessionSavings, session_savings
-from .team import AgentRun, Team, TeamWatcher
+from .parallel import SessionParallel, parallel_line
+from .savings import SessionSavings
+from .team import AgentRun, Team, UsageBook
 from .tiers import GLYPHS
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -139,7 +141,8 @@ class TeamScreen:
         tier, _ = agent_label(agent.agent_type)
         return f"tier:{tier}" if tier else "dim"
 
-    def draw(self, team: Team, state: TeamState, tick: int, savings: SessionSavings | None = None) -> None:
+    def draw(self, team: Team, state: TeamState, tick: int, savings: SessionSavings | None = None,
+             parallel: SessionParallel | None = None) -> None:
         v, screen = self.view, self.view.screen
         screen.erase()
         height, width = screen.getmaxyx()
@@ -154,6 +157,10 @@ class TeamScreen:
         y = self._orchestrator(2, team, now_s, tick, width)
         for text, tone in savings_lines(savings):
             v.put(y, 4, clip(text, width - 6), v.attr(tone))
+            y += 1
+        line = parallel_line(parallel)
+        if line:
+            v.put(y, 4, clip(line, width - 6), v.attr("warn" if parallel.partial else "dim"))
             y += 1
         rows = team.ordered()
         y = self._agents(y + 1, rows, state, now_s, tick, width, height)
@@ -284,17 +291,21 @@ class TeamScreen:
 
 def team_loop(screen, view, session_id: str, session_name: str, read_key, refresh_s: float = 1.0) -> str:
     """Runs until the user goes back ("back") or quits ("quit")."""
-    watcher, ui, state, tick = TeamWatcher(session_id), TeamScreen(view, session_name), TeamState(), 0
+    book, ui, state, tick = UsageBook(), TeamScreen(view, session_name), TeamState(), 0
+    watcher = book.watcher(session_id)
 
-    def fetch() -> tuple[Team, SessionSavings | None]:
+    def fetch() -> tuple[Team, SessionSavings | None, SessionParallel | None]:
         team = watcher.snapshot()
-        return team, session_savings(session_id, watcher.collect()) if team.found else None
+        if not team.found:
+            return team, None, None
+        # Both are cached in the book and recomputed only when a transcript grew.
+        return team, book.savings(session_id), book.parallel(session_id)
 
-    (team, saved), fetched = fetch(), time.monotonic()
+    (team, saved, parallel), fetched = fetch(), time.monotonic()
     while True:
         if time.monotonic() - fetched >= refresh_s:
-            (team, saved), fetched = fetch(), time.monotonic()
-        ui.draw(team, state, tick, saved)
+            (team, saved, parallel), fetched = fetch(), time.monotonic()
+        ui.draw(team, state, tick, saved, parallel)
         tick += 1
         key = read_key(screen)
         if not key or key == "KEY_RESIZE":

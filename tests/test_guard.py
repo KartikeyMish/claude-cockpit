@@ -1,5 +1,6 @@
 """Delegation guard: main-thread edits blocked, work starts with an agent, subagents untouched."""
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -45,6 +46,27 @@ class Guard:
         return self.run(payload)
 
 
+class InProcessGuard(Guard):
+    """Calls guard.py's hook functions directly, with a fake clock for the nudge's batch window."""
+
+    def __init__(self, tmp, **env):
+        super().__init__(tmp, **env)
+        spec = importlib.util.spec_from_file_location("guard_under_test", GUARD)
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+        self.now = 1_000_000.0
+        self.mod.clock = lambda: self.now
+        self.path = self.mod.state_file(self.env["CLAUDE_PLUGIN_DATA"], "s1")
+
+    def run(self, payload):
+        if payload.get("hook_event_name") == "UserPromptSubmit":
+            return self.mod.on_prompt(payload, self.path, True)
+        return self.mod.on_tool(payload, self.path, self.env)
+
+    def later(self, seconds):
+        self.now += seconds
+
+
 def denied(result):
     return bool(result) and result["hookSpecificOutput"]["permissionDecision"] == "deny"
 
@@ -80,7 +102,7 @@ class MainThreadTests(unittest.TestCase):
 
     def test_work_before_any_agent_is_denied_with_a_tier_hint(self):
         for tool, tool_input in (("Read", {"file_path": "/repo/package.json"}), ("Grep", {"pattern": "x"}),
-                                 ("Glob", {"pattern": "*.md"}), ("Bash", {"command": "npm test"}),
+                                 ("Glob", {"pattern": "*.md"}), ("Bash", {"command": "ls -la src"}),
                                  ("WebSearch", {"query": "x"})):
             with self.subTest(tool=tool):
                 result = self.g.tool(tool, **tool_input)
@@ -130,7 +152,7 @@ class MainThreadTests(unittest.TestCase):
 
     def test_agent_launch_opens_a_small_verification_window(self):
         self.g.tool("Agent", subagent_type="orchestrator:routine-worker", prompt="x")
-        results = [self.g.tool("Bash", command="npm test") for _ in range(4)]
+        results = [self.g.tool("Bash", command="ls -la src") for _ in range(4)]
         self.assertEqual([denied(r) for r in results], [False, False, False, True])
         self.assertIn("3 checks", reason(results[-1]))
         self.g.tool("Agent", subagent_type="orchestrator:scout", prompt="y")
@@ -159,7 +181,7 @@ class MainThreadTests(unittest.TestCase):
     def test_agent_report_back_counts_as_delegated(self):
         reminder = self.g.prompt('<agent-message from="a1">\n[Subagent hand-back] done', "p3")
         self.assertIsNone(reminder, "no reminder for notifications")
-        self.assertIsNone(self.g.tool("Bash", command="npm test"))
+        self.assertIsNone(self.g.tool("Bash", command="ls -la src"))
 
 
 class SubagentTests(unittest.TestCase):
@@ -171,6 +193,225 @@ class SubagentTests(unittest.TestCase):
                                      ("Read", {"file_path": "/repo/a.js"})):
                 with self.subTest(tool=tool):
                     self.assertIsNone(g.tool(tool, agent_id="a5ccd54fc9bc49d59", **tool_input))
+
+
+class BuiltinNudgeTests(unittest.TestCase):
+    """Explore / general-purpose skip the tiers: deny the first launch (and the rest of its batch) per
+    prompt, then let a retry through."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.g = InProcessGuard(self.tmp.name)
+        self.g.prompt("find where tokens are refreshed", "p1")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def explore(self, **extra):
+        return self.g.tool("Agent", subagent_type="Explore", prompt="x", **extra)
+
+    def test_first_builtin_launch_is_denied_with_the_matching_tier(self):
+        for builtin, tier in (("Explore", "orchestrator:scout"), ("general-purpose", "orchestrator:routine-worker")):
+            with self.subTest(builtin=builtin):
+                self.g.prompt("new request", f"p-{builtin}")
+                result = self.g.tool("Agent", subagent_type=builtin, prompt="x")
+                self.assertTrue(denied(result))
+                self.assertIn(tier, reason(result))
+                self.assertIn(builtin, reason(result))
+
+    def test_a_parallel_batch_is_denied_as_a_whole_and_a_later_retry_goes_through(self):
+        burst = []
+        for _ in range(3):  # three Agent calls from one assistant message
+            burst.append(denied(self.explore()))
+            self.g.later(0.3)
+        burst.append(denied(self.g.tool("Task", subagent_type="general-purpose", prompt="y")))
+        self.assertEqual(burst, [True, True, True, True])
+        self.assertIsNone(self.g.tool("Agent", subagent_type="orchestrator:scout", prompt="z"),
+                          "tiers in the same batch pass")
+        self.g.later(5)  # the model read the denial and retried
+        self.assertIsNone(self.explore())
+        self.assertIsNone(self.g.tool("Task", subagent_type="general-purpose", prompt="y"),
+                          "one nudge per prompt, not one per built-in type")
+
+    def test_the_window_closes_two_seconds_after_the_first_denial(self):
+        self.assertTrue(denied(self.explore()))
+        self.g.later(1.9)
+        self.assertTrue(denied(self.explore()))
+        self.g.later(0.2)
+        self.assertIsNone(self.explore())
+
+    def test_the_allowed_retry_counts_as_delegated(self):
+        self.assertTrue(denied(self.explore()))
+        self.g.later(5)
+        self.assertIsNone(self.explore())
+        self.assertIsNone(self.g.tool("Read", file_path="/repo/a.js"), "the allowed launch opens the check window")
+
+    def test_the_denied_launch_does_not_count_as_delegated(self):
+        self.assertTrue(denied(self.g.tool("Task", subagent_type="general-purpose", prompt="x")))
+        self.assertTrue(denied(self.g.tool("Read", file_path="/repo/a.js")))
+
+    def test_a_new_prompt_nudges_again(self):
+        self.explore()
+        self.g.later(5)
+        self.g.prompt("next thing", "p2")
+        self.assertTrue(denied(self.explore()))
+
+    def test_an_agent_report_back_does_not_nudge_again(self):
+        self.explore()
+        self.g.later(5)
+        self.explore()
+        self.g.prompt('<task-notification>\n<task-id>a1</task-id> done', "p1-hand-back")
+        self.assertIsNone(self.g.tool("Agent", subagent_type="general-purpose", prompt="y"))
+
+    def test_a_missing_empty_or_odd_subagent_type_runs_general_purpose_and_is_nudged(self):
+        for subagent_type in (None, "", "  ", 7, ["Explore"]):
+            with self.subTest(subagent_type=subagent_type):
+                self.g.prompt("new request", f"p-{subagent_type!r}")
+                data = {} if subagent_type is None else {"subagent_type": subagent_type}
+                result = self.g.tool("Agent", prompt="x", **data)
+                self.assertTrue(denied(result))
+                self.assertIn("general-purpose", reason(result))
+                self.assertIn("orchestrator:routine-worker", reason(result))
+
+    def test_tiers_fork_and_other_agent_types_are_never_nudged(self):
+        for subagent_type in ("orchestrator:scout", "orchestrator:senior-engineer", "fork", "claude-code-guide",
+                              "pr-review-toolkit:code-reviewer", "explore"):
+            with self.subTest(subagent_type=subagent_type):
+                self.assertIsNone(self.g.tool("Agent", subagent_type=subagent_type, prompt="x"))
+
+    def test_subagent_calls_are_never_nudged(self):
+        self.assertIsNone(self.g.tool("Agent", agent_id="a1", subagent_type="Explore", prompt="x"))
+        self.assertIsNone(self.g.tool("Task", agent_id="a1", prompt="no type"))
+
+    def test_bad_or_missing_input_fails_open(self):
+        base = {"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Agent"}
+        for payload in ({**base, "tool_input": {"subagent_type": "Explore"}},  # no prompt_id
+                        {**base, "prompt_id": "p1", "tool_input": "Explore"},
+                        {**base, "prompt_id": "p1", "tool_input": None},
+                        {**base, "prompt_id": "p1"}):
+            with self.subTest(payload=payload):
+                self.assertIsNone(self.g.run(payload))
+
+    def test_a_real_burst_through_the_hook_process_is_denied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g = Guard(tmp)
+            g.prompt("look around", "p1")
+            results = [g.tool("Agent", subagent_type="Explore", prompt=str(i)) for i in range(3)]
+            self.assertEqual([denied(r) for r in results], [True, True, True])
+
+    def test_guard_off_never_nudges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g = Guard(tmp, COCKPIT_GUARD="off")
+            g.prompt("look", "p1")
+            self.assertIsNone(g.tool("Agent", subagent_type="Explore", prompt="x"))
+            self.assertIsNone(g.tool("Agent", prompt="no type"))
+
+
+class HeavyCommandTests(unittest.TestCase):
+    """Builds, tests, deploys and remote shells are work, never one of the post-launch checks."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.g = Guard(self.tmp.name)
+        self.g.prompt("ship the status column", "p1")
+        self.g.tool("Agent", subagent_type="orchestrator:routine-worker", prompt="x")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_heavy_commands_are_denied_even_with_budget_left(self):
+        for command in ("make test", "npm test", "pytest -q tests", "aws s3 ls", "ssh prod-1 uptime",
+                        "cd /repo && make build", "CI=1 npx jest", "env FOO=1 cargo build", "/usr/bin/make",
+                        "git status && docker compose up", "kubectl get pods | head", "make release && make test",
+                        "make test release"):
+            with self.subTest(command=command):
+                result = self.g.tool("Bash", command=command)
+                self.assertTrue(denied(result))
+                self.assertIn("orchestrator:routine-worker", reason(result))
+                self.assertIn("not checks", reason(result))
+        self.assertIsNone(self.g.tool("Read", file_path="/repo/a.js"), "denials don't use up the check budget")
+
+    def test_heavy_commands_are_denied_before_a_launch_too_whatever_the_start_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g = Guard(tmp, COCKPIT_START_BUDGET="5")
+            g.prompt("run the tests", "p1")
+            self.assertIn("not checks", reason(g.tool("Bash", command="npm test")))
+            self.assertIsNone(g.tool("Bash", command="ls -la"))
+
+    def test_release_commands_are_free_like_git(self):
+        commands = ("make release VERSION=1.6.0", "YES=1 make release-finish VERSION=1.6.0",
+                    "make VERSION=1.6.0 DRY_RUN=1 release", "cd /repo && make release VERSION=1.6.0",
+                    "git status && make release VERSION=1.6.0 | tail -20")
+        for command in commands * 2:  # more calls than the budget, and none of it used
+            with self.subTest(command=command):
+                self.assertIsNone(self.g.tool("Bash", command=command))
+        self.assertEqual([denied(self.g.tool("Bash", command="ls")) for _ in range(4)], [False, False, False, True])
+        with tempfile.TemporaryDirectory() as tmp:
+            g = Guard(tmp)
+            g.prompt("cut the release", "p1")
+            self.assertIsNone(g.tool("Bash", command="make release VERSION=1.6.0"), "no agent launch needed")
+            self.assertIsNone(g.tool("Bash", command="YES=1 make release-finish VERSION=1.6.0"))
+
+    def test_release_mixed_with_other_work_follows_the_normal_rules(self):
+        self.assertIn("not checks", reason(self.g.tool("Bash", command="make release && make test")))
+        self.assertIsNone(self.g.tool("Bash", command="make release VERSION=1.6.0 && ls"), "counted as a check")
+        with tempfile.TemporaryDirectory() as tmp:
+            g = Guard(tmp)
+            g.prompt("cut the release", "p1")
+            self.assertIn("open this request with an agent",
+                          reason(g.tool("Bash", command="make release VERSION=1.6.0 && ls")))
+
+    def test_backslash_newline_continuations_join_the_line(self):
+        self.assertIn("not checks", reason(self.g.tool("Bash", command="cd /repo && \\\nmake test")))
+        self.assertIn("not checks", reason(self.g.tool("Bash", command="npm \\\n  test")))
+        with tempfile.TemporaryDirectory() as tmp:
+            g = Guard(tmp)
+            g.prompt("commit it", "p1")
+            self.assertIsNone(g.tool("Bash", command="git add -A && \\\ngit commit -m 'fix: x'"),
+                              "still git-only, so free before any launch")
+
+    def test_wrappers_do_not_hide_the_command(self):
+        for command in ("time make test", "timeout 5 pytest", "timeout -k 2 --signal=KILL 30s npm test",
+                        "env -i PATH=/bin make build", "env -u HOME npm test", "/usr/bin/env CI=1 npx jest",
+                        "nice -n 10 cargo build", "nice -5 make", "command make test", "time -p docker build ."):
+            with self.subTest(command=command):
+                self.assertIn("not checks", reason(self.g.tool("Bash", command=command)))
+        self.assertIsNone(self.g.tool("Bash", command="command -v make"), "a lookup, not a run")
+        self.assertIsNone(self.g.tool("Bash", command="time git status"), "git through a wrapper stays free")
+
+    def test_heredoc_bodies_and_mere_mentions_do_not_count(self):
+        for command in ("cat > notes.txt <<'EOF'\nmake test\nnpm run deploy\nEOF", "echo make test",
+                        "grep -r pytest .", "ls docker/"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.g.tool("Bash", command=command))
+                self.g.tool("Agent", subagent_type="orchestrator:scout", prompt="x")  # fresh check window
+
+    def test_git_only_commands_are_unaffected(self):
+        commit = "git commit -F - <<EOF\nfix: make test pass; npm ci\nEOF"
+        for command in ("git status", commit, "gh pr checks 12", "git log | grep make"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.g.tool("Bash", command=command))
+        for _ in range(5):
+            self.assertIsNone(self.g.tool("Bash", command="git diff --stat"))
+
+    def test_subagent_calls_are_never_affected(self):
+        for command in ("make test", "npm test", "ssh prod-1 uptime"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.g.tool("Bash", agent_id="a1", command=command))
+
+    def test_the_inline_phrase_allows_heavy_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g = Guard(tmp)
+            g.prompt("run make test yourself, no agents needed", "p1")
+            self.assertIsNone(g.tool("Bash", command="make test"))
+
+    def test_bad_input_fails_open(self):
+        base = {"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Bash"}
+        for payload in ({**base, "tool_input": {"command": "make test"}},  # no prompt_id: stand down
+                        {**base, "prompt_id": "p1", "tool_input": {"command": ["make", "test"]}},
+                        {**base, "prompt_id": "p1", "tool_input": {"command": "make 'test"}}):  # untokenisable
+            with self.subTest(payload=payload):
+                self.assertIsNone(self.g.run(payload), "fail-open means no output at all: the call proceeds")
 
 
 class InlineRequestTests(unittest.TestCase):
@@ -233,7 +474,7 @@ class ControlTests(unittest.TestCase):
             g = Guard(tmp, COCKPIT_START_BUDGET="lots", COCKPIT_VERIFY_BUDGET="-4")
             g.prompt("look", "p1")
             self.assertTrue(denied(g.tool("Read", file_path="/r/a")))  # bad value falls back to 0
-            g.tool("Agent", prompt="x")
+            g.tool("Agent", subagent_type="orchestrator:scout", prompt="x")
             self.assertTrue(denied(g.tool("Read", file_path="/r/a")))  # negative clamps to 0
 
     def test_bad_input_fails_open(self):

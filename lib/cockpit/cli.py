@@ -13,7 +13,8 @@
   ccx gc [--idle H] [--yes] [--dry-run]
                            close sessions idle >= H hours (default 6); they stay
                            resumable with `claude --resume`
-  ccx doctor               check the cockpit setup end to end
+  ccx doctor [--json]      check the cockpit setup end to end, incl. sessions that
+                           still run old plugin hooks (⟳) and how to restart them
   ccx setup [--source SRC] [--no-plugin] [--no-ghostty]
                            install or update the Claude Code plugin (release
                            channel) and the Ghostty profile; safe to re-run
@@ -34,7 +35,8 @@ from . import VERSION
 from .pricing import context_level, fmt_signed_usd, fmt_usd
 from .savings import SessionSavings
 from .team import SessionUsage, UsageBook
-from .installer import ghostty_binary, ghostty_dir, run_setup
+from .installer import run_setup
+from .doctor import HOOKS_HINT, HOOKS_MARK, STALE, UNKNOWN, hooks_states, resolve_install
 from .tiers import OVERRIDE_VARS
 from .core import (
     CLAUDE_HOME, DEFAULT_IDLE_HOURS, SESSIONS_DIR, CockpitError, duplicate_of, Session, current_ms, gc_candidates,
@@ -126,15 +128,21 @@ def usage_cells(usage: SessionUsage | None, savings: SessionSavings | None = Non
     return f"{pct} {cost:>8} {saved_cell}"
 
 
+def name_cell(s: Session, hooks_stale: bool = False, width: int = 28) -> str:
+    """NAME, cut to width; `⟳` at its end marks a process running hooks older than hooks.json."""
+    name = s.name + (" [sdk]" if s.is_sdk else "")
+    return f"{name[:width - 2]} {HOOKS_MARK}" if hooks_stale else name[:width]
+
+
 def session_row(s: Session, now: int, usage: SessionUsage | None = None,
-                savings: SessionSavings | None = None) -> str:
+                savings: SessionSavings | None = None, hooks_stale: bool = False) -> str:
     state = s.status or "?"
     state_txt = color(f"{state:<7}", {"busy": "32", "waiting": "1;33"}.get(state, "2"))
     idle = s.idle_seconds(now)
     idle_txt = f"{human_duration(idle):>7}"
     if idle and idle >= parse_hours(DEFAULT_IDLE_HOURS):
         idle_txt = color(idle_txt, "33")
-    name = (s.name + (" [sdk]" if s.is_sdk else ""))[:28]
+    name = name_cell(s, hooks_stale)
     return (f"{s.pid:>7}  {state_txt} {idle_txt} {human_mb(s.rss_kb):>8} "
             f"{human_mb(s.tree_rss_kb):>8} {usage_cells(usage, savings)}  {name:<28} {short_path(s.cwd)}")
 
@@ -144,13 +152,14 @@ SESSIONS_HEADER = (f"{'PID':>7}  {'STATE':<7} {'IDLE':>7} {'RAM':>8} {'+KIDS':>8
 
 
 def render_sessions(sessions: list[Session], now: int, usage: dict[int, SessionUsage] | None = None,
-                    savings: dict[int, SessionSavings] | None = None) -> None:
+                    savings: dict[int, SessionSavings] | None = None,
+                    hooks_stale: frozenset[int] = frozenset()) -> None:
     usage, savings = usage or {}, savings or {}
     print(color(SESSIONS_HEADER, "1"))
     dupes = duplicate_of(sessions)
     for s in sorted(sessions, key=lambda x: x.idle_seconds(now) or -1, reverse=True):
         note = color(f"  ⧉ same chat as {dupes[s.pid]}", "33") if s.pid in dupes else ""
-        print(session_row(s, now, usage.get(s.pid), savings.get(s.pid)) + note)
+        print(session_row(s, now, usage.get(s.pid), savings.get(s.pid), s.pid in hooks_stale) + note)
 
 
 def usage_by_pid(sessions: list[Session], book: UsageBook | None = None) -> dict[int, SessionUsage]:
@@ -185,10 +194,18 @@ def check_flags(args: list[str], allowed: set[str], command: str) -> None:
         raise CockpitError(f"ccx {command}: unknown option {unknown[0]!r} (allowed: {', '.join(sorted(allowed))})")
 
 
+def hooks_stale_json(state: str | None) -> bool | None:
+    """`ccx ls --json` hooks_stale: true/false, or null when unknown (SDK children, no start time)."""
+    return None if state in {None, UNKNOWN} else state == STALE
+
+
 def cmd_ls(args: list[str]) -> int:
     check_flags(args, {"--all", "--json"}, "ls")
+    procs = read_processes()
     now = current_ms()
-    sessions = load_sessions(SESSIONS_DIR, read_processes(), now)
+    sessions = load_sessions(SESSIONS_DIR, procs, now)
+    hooks = hooks_states(procs, sessions, resolve_install(CLAUDE_HOME).stale_after_ms, now)
+    stale = frozenset(pid for pid, state in hooks.items() if state == STALE)
     if "--all" not in args:
         sessions = [s for s in sessions if not s.is_sdk]
     book = UsageBook()
@@ -196,19 +213,21 @@ def cmd_ls(args: list[str]) -> int:
     if "--json" in args:
         rows = [dict(asdict(s), idle_seconds=s.idle_seconds(now), is_sdk=s.is_sdk,
                      usage=(dict(asdict(usage[s.pid]), pct=round(usage[s.pid].pct, 1)) if s.pid in usage else None),
-                     **savings_json(savings.get(s.pid)))
+                     hooks_stale=hooks_stale_json(hooks.get(s.pid)), **savings_json(savings.get(s.pid)))
                 for s in sessions]
         print(json.dumps(rows, indent=2))
         return 0
     if not sessions:
         print("No running Claude sessions found." + ("" if "--all" in args else " (try --all)"))
         return 0
-    render_sessions(sessions, now, usage, savings)
+    render_sessions(sessions, now, usage, savings, stale)
     total = sum(s.tree_rss_kb for s in sessions)
     dupes = duplicate_of(sessions)
     spend = sum(u.cost_usd for pid, u in usage.items() if pid not in dupes)
     print(color(f"\n{len(sessions)} sessions · {human_mb(total)} incl. child processes · "
                 f"≈{fmt_usd(spend)} API-equivalent spend", "2"))
+    if any(s.pid in stale for s in sessions):
+        print(color(HOOKS_HINT, "33"))
     return 0
 
 
@@ -339,92 +358,13 @@ def cmd_gc(args: list[str]) -> int:
 
 
 # ---------------------------------------------------------------- doctor
-
-def check(ok: bool | None, label: str, hint: str = "") -> bool:
-    mark = {True: color("✓", "32"), False: color("✗", "31"), None: color("!", "33")}[ok]
-    print(f"  {mark} {label}" + (color(f"  → {hint}", "2") if hint and ok is not True else ""))
-    return ok is not False
-
+# The checks live in doctor_cmd.py (stale hooks: doctor.py); these helpers are shared.
 
 def run_quiet(argv: list[str], timeout: int = 30) -> subprocess.CompletedProcess | None:
     try:
         return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
-
-
-def doctor_claude() -> bool:
-    path = shutil.which("claude")
-    if not path:
-        return check(False, "claude CLI on PATH", "install from https://code.claude.com/docs/en/setup")
-    out = run_quiet([path, "--version"], 20)
-    return check(bool(out and out.returncode == 0),
-                 f"claude CLI: {out.stdout.strip() if out else 'did not answer'}")
-
-
-def installed_plugin() -> dict | None:
-    out = run_quiet(["claude", "plugin", "list", "--json"])
-    try:
-        plugins = json.loads(out.stdout) if out else []
-    except ValueError:
-        return None
-    if not isinstance(plugins, list):
-        return None
-    return next((p for p in plugins if isinstance(p, dict) and p.get("id") == PLUGIN_ID), {})
-
-
-def doctor_plugin() -> bool:
-    if not shutil.which("claude"):
-        return check(False, "orchestrator plugin", "needs the claude CLI")
-    entry = installed_plugin()
-    if entry is None:
-        return check(None, "orchestrator plugin", "could not read `claude plugin list --json`")
-    if not entry:
-        return check(False, "orchestrator plugin installed", "run: ccx setup")
-    if not entry.get("enabled"):
-        return check(False, "orchestrator plugin enabled", f"claude plugin enable {PLUGIN_ID}")
-    root = entry.get("installPath")
-    agents = sorted(p.stem for p in Path(root).glob("agents/*.md")) if root else []
-    return check(len(agents) == 5, f"orchestrator {entry.get('version')} enabled · agents: {', '.join(agents) or 'none'}")
-
-
-def doctor_routing() -> bool:
-    mode = os.environ.get("COCKPIT_ROUTING", "auto")
-    return check(None if mode in {"off", "0", "false", "no"} else True,
-                 f"routing policy injection: {mode}", "unset COCKPIT_ROUTING to re-enable")
-
-
-def doctor_terminal() -> bool:
-    term = os.environ.get("TERM_PROGRAM", "unknown")
-    in_tmux = bool(os.environ.get("TMUX"))
-    ok = check(None if in_tmux else True, f"terminal: {term}" + (" (inside tmux)" if in_tmux else ""),
-               "tmux needs allow-passthrough + extended-keys; see README")
-    ghostty = ghostty_binary()
-    if not ghostty:
-        return check(None, "Ghostty installed", "brew install --cask ghostty, then: ccx setup") and ok
-    check((ghostty_dir() / "cockpit.conf").exists(), "Ghostty cockpit profile", "run: ccx setup")
-    out = run_quiet([ghostty, "+validate-config"], 20)
-    detail = " | ".join(((out.stdout + out.stderr).strip().splitlines() if out else ["no answer"])[:3])
-    return check(bool(out and out.returncode == 0), "Ghostty config valid", detail) and ok
-
-
-def doctor_sessions() -> bool:
-    if not SESSIONS_DIR.is_dir():
-        return check(None, "session registry", f"{SESSIONS_DIR} missing; `ccx ls` will be empty")
-    procs = read_processes()
-    now = current_ms()
-    sessions = [s for s in load_sessions(SESSIONS_DIR, procs, now) if not s.is_sdk]
-    stale = gc_candidates(sessions, now, parse_hours(DEFAULT_IDLE_HOURS), protected_pids(procs))
-    label = f"{len(sessions)} interactive sessions"
-    usage = usage_by_pid(sessions)
-    full = [s for s in sessions if s.pid in usage and context_level(usage[s.pid].pct) == "critical"]
-    if full:
-        names = ", ".join(f"{s.name} ({usage[s.pid].pct:.0f}%)" for s in full)
-        check(None, f"context nearly full: {names}", "run /compact in those sessions or start fresh")
-    if stale:
-        held = human_mb(sum(s.tree_rss_kb for s in stale))
-        return check(None, f"{label}; {len(stale)} idle > {DEFAULT_IDLE_HOURS}h hold {held}", "ccx gc")
-    return check(True, label)
 
 
 def settings_env(path: Path) -> dict[str, str]:
@@ -442,19 +382,9 @@ def tier_overrides(environ: dict[str, str], settings: dict[str, str]) -> list[st
             for name in OVERRIDE_VARS if environ.get(name) or settings.get(name)]
 
 
-def doctor_overrides() -> bool:
-    found = tier_overrides(dict(os.environ), settings_env(CLAUDE_HOME / "settings.json"))
-    if found:
-        return check(None, "tier models/efforts are overridden: " + ", ".join(found),
-                     "unset these so each agent runs its own model and effort")
-    return check(True, "agents run their own model and effort (no global overrides)")
-
-
-def cmd_doctor(_args: list[str]) -> int:
-    print(color(f"claude-cockpit doctor (ccx {VERSION})", "1"))
-    results = [doctor_claude(), doctor_plugin(), doctor_overrides(), doctor_routing(),
-               doctor_terminal(), doctor_sessions()]
-    return 0 if all(results) else 1
+def cmd_doctor(args: list[str]) -> int:
+    from .doctor_cmd import cmd_doctor as run_doctor  # imports cli: load lazily
+    return run_doctor(args)
 
 
 # ---------------------------------------------------------------- entry

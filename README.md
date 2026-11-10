@@ -103,7 +103,7 @@ Commit this to a project's `.claude/settings.json`. Everyone who trusts the fold
 | Plugin only | `claude plugin marketplace update claude-cockpit`, then `claude plugin update orchestrator@claude-cockpit` |
 | Source | `git pull` (or check out the new tag), then `./install.sh` |
 
-Restart open Claude sessions to load a new plugin version (`claude plugin update` applies on restart).
+After updating the plugin, restart running sessions (`ccx doctor` shows which). Claude Code reads a plugin's hook list once, when the process starts; `/clear` and compaction keep the old one. For a local checkout install, hook scripts are live and only hooks.json changes need a restart; for marketplace installs, any plugin update needs a restart. To restart a session, `exit`, then run `claude --resume <id>` in that directory. The dashboard and `ccx ls` mark those sessions with `⟳`.
 
 **Auto-update.** Claude Code doesn't auto-update third-party marketplaces by default. To turn it on, run `/plugin`, open **Marketplaces**, pick **claude-cockpit** and enable auto-update. Because `#stable` only moves at release, auto-update only ever brings released versions. `ccx` itself updates through Homebrew (or `git pull`).
 
@@ -133,6 +133,14 @@ brew uninstall --cask claude-cockpit              # add --zap to delete ~/.confi
 
 The main session stays the **orchestrator** and your second brain: it plans, briefs, owns git state, reviews and verifies. **Agents do the work, short requests included.** A one-file lookup goes to scout and a one-line edit goes to routine-worker. Anything multi-step opens with a short **visible plan** where every step names a tier. Independent steps launch in parallel, and edits in the same repo still go to agents (one at a time, or isolated worktrees).
 
+**Split by area (policy v1.6).** Work that spans 2+ repos, services or independent areas gets one agent per area, all launched in one message. Parallel edits run in `isolation: "worktree"` or touch disjoint files in the shared tree. One agent stays right when the parts need each other's results, and small parts (≤3 tool calls) fold into an agent that's launching anyway. When a step has to wait, the plan says why: a data dependency, a shared browser, one working tree, one git owner. Broad unknowns get 2–4 parallel scouts by area, but only when the search space really splits. While agents run, the orchestrator doesn't poll or narrate. It waits for the hand-backs and reacts once per batch.
+
+**Agent reports.** Each tier ends with a report under its word cap and sends no interim messages unless it's blocked. Two optional lines tell the orchestrator what to do next:
+- `ESCALATE: <tier>` re-routes the task upward, with the findings so far.
+- `SPLIT: <area B> | <area C> …` is for an agent that finds its task spans independent areas. It finishes the first coherent area and lists the rest. The orchestrator then launches those areas in parallel, each with the findings so far.
+
+Use the tiers rather than the built-in `Explore`, `general-purpose` or `fork` agents. Those skip the tiers and run on the main session's model: a read-only Explore run on Opus costs about twice what scout does. The exception is when no tier fits, such as a specialist reviewer you installed.
+
 ### Delegation guard
 
 The policy asks; the guard enforces it. The plugin's `UserPromptSubmit` and `PreToolUse` hooks act on the **main thread only**. Calls made inside an agent carry an `agent_id` and pass through untouched.
@@ -140,8 +148,9 @@ The policy asks; the guard enforces it. The plugin's `UserPromptSubmit` and `Pre
 | In the main thread | What happens |
 |---|---|
 | Edit / Write / NotebookEdit | Blocked, with a note to brief routine-worker or senior-engineer. Files under `~/.claude` (memory, plans, settings) are exempt. |
-| Read / Grep / Glob / Bash / WebFetch / WebSearch | Blocked until an agent has been launched for the request. After each launch, 3 calls are allowed for checking the result. |
-| Shell commands made only of `git`/`gh` (plus `cd`, and pipes into `head`, `grep` and the like), agent output files, MCP tools, questions to you | Never limited |
+| Read / Grep / Glob / Bash / WebFetch / WebSearch | Blocked until an agent has been launched for the request. After each launch, 3 calls are allowed for checking the result. Builds, tests, deploys and remote commands (`make`, `npm`, `pytest`, `docker`, `aws`, `ssh`, …, also behind `env`, `time`, `timeout` or `nice`) are work, not checks, and are always blocked. |
+| Agent / Task with `subagent_type` `Explore` or `general-purpose`, or with none (that runs general-purpose) | The first one per request is blocked, along with the rest of its parallel batch (2 s), with the tier to use instead: scout for read-only discovery, or routine-worker / senior-engineer / debugger for work. It doesn't count as delegating. A later retry in the same request goes through, for when no tier fits. Tier agents, `fork` (it carries the full context, which is sometimes the point) and agents you installed are never touched. |
+| Shell commands made only of `git`/`gh` and `make release` / `make release-finish` (state you own; plus `cd`, and pipes into `head`, `grep` and the like), agent output files, MCP tools, questions to you | Never limited |
 | Each prompt you send | Gets a one-line routing reminder (about 40 tokens) |
 
 When you want it done in the main thread, say so: *"do it yourself"*, *"no agents needed"*, *"don't delegate"*. That request then runs inline. Complaints like "why were no agents spun up?" don't count as asking for inline work.
@@ -173,7 +182,7 @@ Just type **`ccx`**. The cockpit opens; press `⏎` to start Claude in the curre
 | `ccx team [name]` | Live team view of the agents inside a session |
 | `ccx mem` | RAM by terminal, interactive sessions, SDK/background sessions |
 | `ccx gc` | Close sessions idle ≥ 6h after confirming (`--idle 2`, `--dry-run`, `--yes`). They stay resumable with `claude --resume` |
-| `ccx doctor` | Checks CLI, plugin, agents, routing, terminal, Ghostty config, idle sessions |
+| `ccx doctor` | Checks CLI, plugin (version and source in effect), agents, routing/guard switches, guard data dir, terminal, Ghostty config, idle sessions, and sessions still running old plugin hooks (`⟳`) with the exact restart command (`--json`; exits 1 when something needs action) |
 
 **Team view.** Select a session and press `v` (or run `ccx team`) to watch its agents work together, live:
 
@@ -250,13 +259,22 @@ Sizes that aren't logged as tokens (brief, launch notice, report) are estimated 
 - Transcripts from Claude Code 2.1.281–2.1.300 sometimes logged only a streaming snapshot of a response's output tokens (a few tokens instead of the final count). Where a later record has the final count, it is used. Where none does, that output stays undercounted, in both the actual and the estimated costs.
 - Everything is an API-equivalent estimate from logs, not a bill.
 
+**Parallelism.** `ccx savings` also prints a Parallelism block (and a `parallelism` object in `--json`), and the team view adds a line such as `parallel: max 3 · 41% overlap · 12m saved`. The definitions:
+
+- **Agent activity:** an agent's transcript timestamps, split into intervals wherever it logged nothing for more than 15 minutes, so an agent resumed later isn't counted as busy while it waited. A still-running agent's last interval ends at its latest record. Its *duration* is the sum of its intervals.
+- **Saved by overlap** = sum of agent durations − the union of their intervals: the wall-clock time parallel agents already saved. *Overlap share* = that saving ÷ the sum of durations. *Max concurrent* = the most agents active at one instant (intervals that merely touch don't count as overlapping). All three count top-level agents only: an agent launched by another agent runs while its parent waits, so counting both would invent overlap.
+- **Request:** one prompt you typed, and everything up to the next one. *Agents per request* counts main's agent launches in requests that delegated at all. A *multi-step request* has at least 20 tool calls, main's and its agents' together; the block counts those that one agent did alone.
+- **Sequential launches that looked independent (heuristic):** in one request, agent B was launched only after agent A had finished, B's brief has no code-like token (a path, identifier or id) that first appeared in A's report, and B touched no file A edited. Launched together, such a chain would have finished in the time of its longest agent; the estimate is the sum of durations minus the longest. On a hand-checked sample about 7 in 10 flagged pairs were truly independent. A dependency that leaves no shared path or id, a shared single resource (one browser, one working tree) and anything that isn't a consecutive pair are invisible to it.
+- **Main calls over the guard budget (approximate):** counted only in sessions where the routing policy was injected. These are main-thread calls the guard would deny under its default rules: file edits outside `~/.claude`, and Read/Grep/Glob/Bash/WebFetch/WebSearch beyond none before the first agent launch of a prompt and 3 after each launch. Heavy shell commands (builds, tests, deploys, remote shells such as `make`, `npm`, `pytest`, `docker`, `ssh`) count whatever budget is left. Commands made only of git/gh and `make release`/`release-finish`, and reads of `~/.claude` or Claude's temp folder are free. The count mirrors those rules from the transcript. Like the guard, it lets a work call through when an Agent call follows it in the same response (the guard re-checks such a denial after 150 ms), and it resolves relative paths against the session's working directory. Where it still differs from the guard: it doesn't resolve symlinks, so a link into `~/.claude` or the temp folder counts as work; it takes `TMPDIR`/`CLAUDE_CODE_TMPDIR` from ccx's own environment rather than Claude's; and it can't see `COCKPIT_*` overrides or whether the guard was installed and on. The policy counts as injected only when its SessionStart hook output is in the transcript, not when a tool merely read the policy file. Read the count as "work the policy says belongs to agents", not as guard failures.
+- **`~` partial sessions:** a transcript over 64 MB is read from its end, so its early requests, launches and activity are missing. Those sessions show `~` (in the team view, `parallel~:`), and `ccx savings` leaves them out of the parallelism totals and says how many it left out.
+
 On an 80-column terminal the session table drops the `DIR` column to make room for `SAVED`; it returns at 87 columns.
 
 ## Rolling out to a team
 
 1. Install from the release channel (Homebrew, or the project settings above), so everyone runs the same released version and updates arrive through `ccx setup`, `/plugin update` or auto-update.
 2. Measure before and after rather than assuming a win: compare `/usage`, or OpenTelemetry cost and token metrics, alongside the outcomes people care about, such as PRs merged and rework.
-3. Run `make eval` before every change to the agents or policy. It checks that each kind of task reaches the right tier, that short lookups and edits are delegated too, that "do it yourself" stays inline, and that migrations never reach the max-effort architect.
+3. Run `make eval` before every change to the agents or policy. It checks that each kind of task reaches the right tier, that short lookups and edits are delegated too, that two independent services get one agent each, launched together and without built-in agents, that "do it yourself" stays inline, and that migrations never reach the max-effort architect.
 4. Keep opt-outs easy (above) and listen for "it delegated when it shouldn't have". `COCKPIT_START_BUDGET=1` gives the orchestrator one look before it delegates.
 
 ## Why Ghostty, and where the memory goes
@@ -334,7 +352,7 @@ plugins/orchestrator/
   evals/                               routing evals
   settings.json, scripts/              live subagent status rows
   themes/cockpit.json                  Claude Code colour theme
-bin/ccx, lib/cockpit/                  cockpit: core rules, cli, curses dashboard, `ccx setup` (installer.py); Python 3.9+, stdlib
+bin/ccx, lib/cockpit/                  cockpit: core rules, cli, curses dashboard, `ccx setup` (installer.py), `ccx doctor` (doctor.py, doctor_cmd.py); Python 3.9+, stdlib
 terminal/ghostty/cockpit.conf          Ghostty profile
 scripts/release.py                     `make release`
 .github/workflows/                     CI and the Release workflow

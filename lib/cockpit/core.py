@@ -17,7 +17,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 CLAUDE_HOME = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")))
 SESSIONS_DIR = CLAUDE_HOME / "sessions"
@@ -115,17 +115,23 @@ def parse_ps(text: str) -> dict[int, Proc]:
     return procs
 
 
-def read_processes() -> dict[int, Proc]:
+PS_ARGV = ("ps", "-A", "-ww", "-o", "pid=,ppid=,rss=,etime=,args=")
+
+
+def run_ps() -> str:
+    """Raw `ps` rows for parse_ps. The one place ccx asks the OS for processes."""
     try:
-        result = subprocess.run(
-            ["ps", "-A", "-ww", "-o", "pid=,ppid=,rss=,etime=,args="],
-            capture_output=True, text=True, timeout=10, check=True,
-        )
+        result = subprocess.run(list(PS_ARGV), capture_output=True, text=True, timeout=10, check=True)
     except FileNotFoundError as exc:
         raise CockpitError("`ps` not found; ccx needs procps (Linux) or BSD ps (macOS)") from exc
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise CockpitError(f"could not list processes: {exc}") from exc
-    return parse_ps(result.stdout)
+    return result.stdout
+
+
+def read_processes(run: Callable[[], str] | None = None) -> dict[int, Proc]:
+    """Live processes; `run` replaces the `ps` call (tests pass canned output)."""
+    return parse_ps((run or run_ps)())
 
 
 def children_index(procs: dict[int, Proc]) -> dict[int, list[int]]:

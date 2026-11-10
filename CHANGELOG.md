@@ -4,6 +4,42 @@ All notable changes to claude-cockpit. The `orchestrator` plugin, `ccx` and the 
 
 ## [Unreleased]
 
+### Routing policy v1.6
+Field data from 14 days of real transcripts (24 sessions, 158 agent runs) showed four problems:
+- 28 runs had one agent working across 2+ repos or 3+ areas, and one of them grew from 54k to 207k context.
+- 13 pairs of independent agents were launched one after the other, losing ≥19.5 min.
+- Main's reactions to hand-backs and interim messages were 64% of delegation overhead.
+- About 25% of runs used built-in agent types that skip the tiers.
+
+The changes:
+- **Split by area.** Work spanning 2+ repos, services or independent areas gets one agent per area, launched in one message. Parallel edits use `isolation: "worktree"` or touch disjoint files. One agent stays right when the parts depend on each other's results, and ≤3-call parts fold into an agent that's launching anyway (no hard minimum: small runs only break even).
+- **Independent plan steps launch together.** A step that must wait names why: a data dependency, a shared browser, one working tree or one git owner. The plan template shows a parallel split.
+- **Scout-first discovery:** 2–4 parallel scouts by area for broad unknowns, only when the search space really splits.
+- **Fewer wake-ups.** While agents run, main doesn't poll or narrate, and reacts once per batch of hand-backs.
+- **Agent report contract** (all five tiers):
+  - an optional `SPLIT: <area B> | <area C> …` line: the agent finishes the first coherent area (unless its brief assigns all of them) and lists the rest;
+  - main handles SPLIT like `ESCALATE`, launching the listed areas in parallel with the findings so far;
+  - agents send no interim progress messages unless they're blocked.
+- **Built-in agents:** the policy steers off `Explore`, `general-purpose` and `fork` unless no tier fits. The guard now denies the first main-thread `Explore` or `general-purpose` launch per prompt, plus the rest of its parallel batch (2 s), and names the tier to use. An Agent call with no `subagent_type` runs general-purpose, so it's nudged too. That denial doesn't count as delegating, and a later retry in the same prompt goes through. Agent hand-backs don't re-arm it. `fork` is left alone because it carries the full context, which is sometimes intended. User-installed specialists are also untouched.
+- **Heavy commands are never checks.** The guard's 3 checks after a launch or hand-back had let builds, test re-runs and even a release run in the main thread. The guard now always denies shell commands with a `make`, `npm`, `pnpm`, `yarn`, `npx`, `pytest`, `tox`, `cargo`, `gradle`, `mvn`, `terraform`, `kubectl`, `docker`, `helm`, `aws`, `ssh` or `scp` segment, pointing at routine-worker (or debugger for failures). A denial doesn't use up a check. `env`, `time`, `timeout` and `nice` don't hide the command, and a backslash-newline continuation no longer splits it (which also kept multi-line git commands from being free). `make release` and `make release-finish` (with any `VAR=…`) are free like git, because main owns release state, as long as the rest of the command is only git/gh or navigation. Heredoc bodies don't count, and "do it yourself" still allows heavy commands. Known misses: `bash -c`, `xargs`, `sudo`, `eval` and control-flow forms, which the normal check budget still limits. `ccx`'s guard-budget metric mirrors these rules, and a test keeps the two in agreement.
+- The policy says builds, tests, deploys and remote commands always go to an agent, and main checks by reading the agent's output and the diff. Plan steps get their ✓ in the final report, not as narration.
+- The policy budget is now 5,000 chars (it's 4,967).
+- The title stays tied to the plugin version: `make release` turns it into `policy v1.6` with 1.6.0, so resumed sessions pick up the new text.
+- **New eval** `route-parallel-split`: two independent services, one change each. It checks for one tier agent per area launched together, that both changes land, and that no built-in agents are used. A format test now covers every eval case.
+
+### ccx
+- **Parallelism metrics** in `ccx savings` (a Parallelism block, and `parallelism` in `--json`) and in the team view header (`parallel: max 3 · 41% overlap · 12m saved`). They cover:
+  - max concurrent agents, overlap share, and wall-clock saved by overlap;
+  - agents per request, and multi-step requests one agent did alone;
+  - sequential launches that looked independent, with the wall-clock a joint launch would have saved (a heuristic, labelled as one);
+  - main-thread calls over the guard's budget (approximate, mirrored from the guard's default rules).
+
+  Overlap and concurrency count top-level agents only, so a parent waiting on its child doesn't count as overlap. Sessions whose transcript was too large to read whole are marked `~` and left out of the totals. The guard-budget mirror lets a work call through when an Agent call follows in the same response (the guard re-checks it after 150 ms), resolves relative paths against the session's cwd, and treats the policy as injected only when its SessionStart hook output is in the transcript. Definitions and caveats are in README "Measuring savings". The metrics are read incrementally with the existing tailers, and the team view recomputes them only when a transcript grows.
+
+- **Stale-hook check.** Claude Code reads a plugin's hook list once per process; `/clear` and compaction keep it. `ccx doctor` flags every interactive session whose process started before the plugin's hooks changed, with the exact fix: `exit`, then `cd <dir> && claude --resume <id>`. For a local checkout install, hook scripts are live and only hooks.json changes need a restart; for marketplace installs, any plugin update needs a restart. The hooks file is found from the checkout's marketplace.json (local) or the registry's installPath (marketplace), honours plugin.json's `hooks` and `CLAUDE_CONFIG_DIR`, and marketplace installs also count the registry's `lastUpdated`. Only processes Claude registered as sessions count (not `claude -p`, `claude mcp serve` or SDK children), and a process whose start time can't be read, or a hooks file dated in the future (a warning of its own), gives "unknown", never stale. A session id that isn't a UUID is never pasted into the restart command.
+- **`ccx doctor --json`**, and exit code 1 only when something needs action (warnings keep 0). New checks: plugin version and source in effect, plugin enabled, routing policy version injected vs installed per session, guard data dir writable, `COCKPIT_ROUTING`/`COCKPIT_GUARD` off in the environment or settings.json.
+- **`⟳` marker** after the session name in the dashboard and `ccx ls` for sessions running old hooks, with a one-line hint ("restart to load current hooks: exit, then claude --resume"); `hooks_stale` in `ccx ls --json` (`null` when unknown). The dashboard caches the hooks.json lookup and reuses the process start times it already reads.
+
 ## [1.5.0] - 2026-11-10
 First public release, under the MIT license. v1.4 was never released on its own; its notes are folded in below.
 

@@ -19,8 +19,9 @@ from .pricing import context_level, fmt_signed_usd, fmt_usd
 from .savings import SessionSavings
 from .team import SessionUsage, UsageBook
 from .tiers import COLOURS, load_tiers
+from .doctor import HOOKS_HINT, HOOKS_MARK, HooksProbe, stale_pids
 from .core import (
-    DEFAULT_IDLE_HOURS, SESSIONS_DIR, CockpitError, Proc, Session, current_ms, duplicate_of, gc_candidates,
+    CLAUDE_HOME, DEFAULT_IDLE_HOURS, SESSIONS_DIR, CockpitError, Proc, Session, current_ms, duplicate_of, gc_candidates,
     human_duration, human_mb, load_sessions, parse_hours, protected_pids, read_processes,
     short_path, system_memory_kb, terminal_totals_kb, terminate,
 )
@@ -64,6 +65,7 @@ class Snapshot:
     error: str = ""
     usage: dict[int, SessionUsage] = field(default_factory=dict)   # pid -> context + spend
     savings: dict[int, SessionSavings] = field(default_factory=dict)  # pid -> delegation savings
+    hooks_stale: frozenset[int] = frozenset()  # pids running hooks older than hooks.json (restart them)
 
     @property
     def claude_kb(self) -> int:
@@ -226,6 +228,19 @@ def saved_cell(savings: SessionSavings | None) -> tuple[str, str]:
     return text, "warn" if savings.saved_usd < 0 else "ok"
 
 
+def name_cell(session: Session, name_w: int, hooks_stale: bool) -> str:
+    """The NAME cell, name_w - 1 wide; a stale-hooks session ends in ` ⟳` without widening it."""
+    name = session.name + (" [bg]" if session.is_sdk else "")
+    width = name_w - 1
+    text = f"{fit(name, width - 2)} {HOOKS_MARK}" if hooks_stale else fit(name, width)
+    return f"{text:<{width}}"
+
+
+def footer_hint(snap: Snapshot, rows: list[Session]) -> str:
+    """Legend for ⟳, shown above the key bar while a listed session needs a restart."""
+    return HOOKS_HINT if any(s.pid in snap.hooks_stale for s in rows) else ""
+
+
 def state_glyph(session: Session, now: int, tick: int) -> tuple[str, str]:
     if session.status == "waiting":
         return ("◉" if tick % 2 else "○"), "warn"   # blocked on the user: blink
@@ -239,7 +254,18 @@ def state_glyph(session: Session, now: int, tick: int) -> tuple[str, str]:
 
 # ---------------------------------------------------------------- data
 
-def take_snapshot(book: UsageBook | None = None) -> Snapshot:
+_PROBE: HooksProbe | None = None
+
+
+def hooks_probe() -> HooksProbe:
+    """One cached hooks.json lookup per dashboard process (re-checked every few seconds)."""
+    global _PROBE
+    if _PROBE is None:
+        _PROBE = HooksProbe(CLAUDE_HOME)
+    return _PROBE
+
+
+def take_snapshot(book: UsageBook | None = None, probe: HooksProbe | None = None) -> Snapshot:
     try:
         procs: dict[int, Proc] = read_processes()
     except CockpitError as exc:
@@ -257,9 +283,11 @@ def take_snapshot(book: UsageBook | None = None) -> Snapshot:
                 if saved:
                     savings[s.pid] = saved
         book.keep_only({s.session_id for s in sessions if s.session_id})
+    hooks_ms = (probe or hooks_probe()).stale_after_ms()
     return Snapshot(
         sessions=sessions, now=now, protected=frozenset(protected_pids(procs)),
         terminals=terminal_totals_kb(procs), system_kb=system_memory_kb(), usage=usage, savings=savings,
+        hooks_stale=stale_pids(procs, sessions, hooks_ms, now),
     )
 
 
@@ -347,7 +375,7 @@ class View:
         y = self._sessions(y + 1, snap, state, rows, tick, height, width)
         if state.show_tiers and height - y >= 9:
             y = self._tiers(y + 1, width)
-        self._footer(state, height, width)
+        self._footer(state, height, width, footer_hint(snap, rows))
         self.screen.refresh()
 
     def _header(self, snap: Snapshot, width: int) -> int:
@@ -420,8 +448,10 @@ class View:
         x = self.put(y, x, glyph + " ", self.attr(tone, curses.A_BOLD))
         dupes = duplicate_of(snap.sessions)
         you = "  ◀ you" if s.pid in snap.protected else (f"  ⧉ same chat as {dupes[s.pid]}" if s.pid in dupes else "")
-        name = fit(s.name + (" [bg]" if s.is_sdk else ""), name_w - 1)  # column 6, same right edge as NAME
-        x = self.put(y, x, f"{name:<{name_w - 1}} ", sel | (curses.A_BOLD if selected else 0))
+        name, name_x = name_cell(s, name_w, s.pid in snap.hooks_stale), x  # column 6, same right edge as NAME
+        x = self.put(y, x, f"{name} ", sel | (curses.A_BOLD if selected else 0))
+        if s.pid in snap.hooks_stale:  # recolour the mark so it reads as an alert
+            self.put(y, name_x + name.rindex(HOOKS_MARK), HOOKS_MARK, self.attr("warn", curses.A_BOLD) | sel)
         if dir_w:
             x = self.put(y, x, f"{fit(short_path(s.cwd), dir_w):<{dir_w}} ", self.attr("dim") | sel)
         x = self.put(y, x, f"{(s.status or '?'):<7} ", self.attr(tone) | sel)
@@ -456,7 +486,7 @@ class View:
             y += 1
         return y
 
-    def _footer(self, state: UiState, height: int, width: int) -> None:
+    def _footer(self, state: UiState, height: int, width: int, hint: str = "") -> None:
         if state.mode == "input-wt":
             prompt = "worktree name ⟩ "
             x = self.put(height - 2, 2, prompt, self.attr("accent", curses.A_BOLD))
@@ -465,6 +495,8 @@ class View:
             return
         if state.message:
             self.put(height - 2, 2, fit(state.message, width - 4), self.attr(state.message_kind, curses.A_BOLD))
+        elif hint:
+            self.put(height - 2, 2, fit(hint, width - 4), self.attr("warn"))
         x = 2
         for key, label in KEYS_MAIN:
             if x + len(key) + len(label) + 3 >= width:
@@ -572,4 +604,4 @@ def run_dashboard() -> int:
 
 
 __all__ = ["run_dashboard", "handle_key", "UiState", "Snapshot", "bar", "fit", "visible", "saved_cell",
-           "session_columns", "sessions_header"]
+           "session_columns", "sessions_header", "name_cell", "footer_hint"]
