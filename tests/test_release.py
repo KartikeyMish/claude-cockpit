@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -36,30 +37,75 @@ First public release.
 """
 
 
+def release_consistency_problems(root):
+    """What would make `verify-tag` or the version tests fail for ROOT's current version."""
+    repo = Repo(root)
+    version = repo.current_version()
+    problems = list(repo.version_problems(version))
+    text = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    if not release.changelog_section(text, version):
+        problems.append(f"CHANGELOG has no [{version}] notes")
+    sections = release.changelog_sections(text)
+    if not sections or sections[0][0] != "Unreleased":
+        problems.append("CHANGELOG does not open with [Unreleased]")
+    versions = [release.parse_semver(name) for name, _, _ in sections[1:]]
+    if versions != sorted(versions, reverse=True) or len(versions) != len(set(versions)):
+        problems.append(f"CHANGELOG versions are not unique and newest first: {versions}")
+    problems += [f"[{name}] has no YYYY-MM-DD date" for name, day, _ in sections[1:]
+                 if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day or "")]
+    return version, problems
+
+
 class VersionConsistencyTests(unittest.TestCase):
     """The shipped tree: one version everywhere, and notes for it."""
 
     def test_every_version_field_agrees(self):
-        repo = Repo(ROOT)
-        version = repo.current_version()
-        self.assertEqual(repo.version_problems(version), [])
+        version, problems = release_consistency_problems(ROOT)
+        self.assertEqual(problems, [])
         sys.path.insert(0, str(ROOT / "lib"))
         from cockpit import VERSION
         self.assertEqual(VERSION, version)
 
-    def test_changelog_has_notes_for_the_current_version(self):
-        text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertTrue(release.changelog_section(text, Repo(ROOT).current_version()))
-
     def test_changelog_is_in_release_format_newest_first(self):
-        sections = release.changelog_sections((ROOT / "CHANGELOG.md").read_text(encoding="utf-8"))
-        self.assertEqual(sections[0][0], "Unreleased")
-        versions = [release.parse_semver(name) for name, _, _ in sections[1:]]
-        self.assertEqual(versions, sorted(versions, reverse=True))
-        self.assertEqual(len(versions), len(set(versions)))
-        for name, day, _ in sections[1:]:
-            with self.subTest(version=name):
-                self.assertRegex(day or "", r"^\d{4}-\d{2}-\d{2}$")
+        self.assertEqual(release.changelog_sections((ROOT / "CHANGELOG.md").read_text(encoding="utf-8"))[0][0],
+                         "Unreleased")
+
+
+# Suites that read version state; they must also pass on a tree `make release` has just bumped.
+VERSION_SENSITIVE = ["test_release_flow", "test_release", "test_plugin"]
+NESTED = "COCKPIT_BUMPED_TREE_TEST"
+
+
+@unittest.skipIf(os.environ.get(NESTED), "already running inside a bumped copy")
+class BumpedTreeTests(unittest.TestCase):
+    """Regression for the 1.6.0 release: `make release` bumps the real files, then runs
+    `make test`. A copy of this repo, bumped the same way, must stay consistent and keep
+    the version-sensitive suites green, for a patch, a minor and a major release."""
+
+    def bumped_copy(self, tmp, target):
+        copy = Path(tmp) / "repo"
+        shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns(".git", "__pycache__", "results", "*.pyc"))
+        changelog = copy / "CHANGELOG.md"
+        text = changelog.read_text(encoding="utf-8")
+        if not release.unreleased_body(text):  # right after a release [Unreleased] is empty
+            text = text.replace("## [Unreleased]\n", "## [Unreleased]\n- Regression fixture entry.\n", 1)
+            changelog.write_text(text, encoding="utf-8")
+        for path, new_text in Repo(copy).bumped_files(target, "2099-01-01").items():
+            path.write_text(new_text, encoding="utf-8")
+        return copy
+
+    def test_a_bumped_copy_stays_consistent_and_its_release_tests_pass(self):
+        major, minor, patch = release.parse_semver(Repo(ROOT).current_version())
+        for target in (f"{major}.{minor}.{patch + 1}", f"{major}.{minor + 1}.0", f"{major + 1}.0.0"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:
+                copy = self.bumped_copy(tmp, target)
+                version, problems = release_consistency_problems(copy)
+                self.assertEqual((version, problems), (target, []))
+                self.assertEqual(release.unreleased_body((copy / "CHANGELOG.md").read_text(encoding="utf-8")), "")
+                out = subprocess.run([sys.executable, "-m", "unittest", *VERSION_SENSITIVE], cwd=copy / "tests",
+                                     env={**os.environ, NESTED: "1"}, capture_output=True, text=True,
+                                     timeout=300, check=False)
+                self.assertEqual(out.returncode, 0, f"on a tree bumped to {target}:\n{out.stderr[-3000:]}")
 
 
 class PureFunctionTests(unittest.TestCase):

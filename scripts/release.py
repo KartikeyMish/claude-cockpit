@@ -436,7 +436,7 @@ class Release:
         self.must(self.git("add", "--", *self.rel_paths(), mutate=True), "git add")
         self.must(self.git("commit", "-m", f"chore: release {self.tag}", mutate=True), "git commit")
         if self.dry_run:
-            return before
+            return "<release commit>"  # what later steps (stable) would point at
         after = self.git("rev-parse", "HEAD").out.strip()
         if not after or after == before:
             raise ReleaseError(f"git commit did not create a commit (HEAD is still {before[:7]})")

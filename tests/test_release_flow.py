@@ -54,15 +54,30 @@ First public release.
 NO_UNRELEASED = CHANGELOG.replace("- **New thing.** It works.\n\n### Details\n- more\n", "")
 
 
+# The fixture repository's own files, always at 1.5.0. Never copy the live repo's
+# version files here: `make release` runs these tests on a tree it has just bumped,
+# so a copy would already say the version being released (that broke the 1.6.0 run).
+FIXTURE_FILES = {
+    "plugins/orchestrator/.claude-plugin/plugin.json": json.dumps({
+        "name": "orchestrator", "version": "1.5.0", "description": "fixture",
+        "author": {"name": "Fixture"}, "license": "MIT"}, indent=2) + "\n",
+    ".claude-plugin/marketplace.json": json.dumps({
+        "name": "claude-cockpit", "owner": {"name": "Fixture"},
+        "plugins": [{"name": "orchestrator", "source": "./plugins/orchestrator", "version": "1.5.0"}]},
+        indent=2) + "\n",
+    "lib/cockpit/__init__.py": '"""fixture"""\n\nVERSION = "1.5.0"\n',
+    "plugins/orchestrator/hooks/routing-policy.md": "# Orchestrator routing (claude-cockpit policy v1.5)\n\nbody\n",
+}
+
+
 class Workspace:
-    """A temporary copy of the version-bearing files plus a tap checkout."""
+    """A self-contained fixture repository at 1.5.0 plus a tap checkout."""
 
     def __init__(self, tmp, changelog=CHANGELOG):
         self.root = Path(tmp) / "repo"
-        for rel in ("plugins/orchestrator/.claude-plugin/plugin.json", ".claude-plugin/marketplace.json",
-                    "lib/cockpit/__init__.py", "plugins/orchestrator/hooks/routing-policy.md"):
+        for rel, text in FIXTURE_FILES.items():
             (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(ROOT / rel, self.root / rel)
+            (self.root / rel).write_text(text)
         (self.root / "CHANGELOG.md").write_text(changelog)
         self.tap = Path(tmp) / "tap"
         (self.tap / "Casks").mkdir(parents=True)
