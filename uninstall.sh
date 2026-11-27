@@ -19,6 +19,16 @@ if command -v claude >/dev/null; then
   if claude plugin marketplace remove "$MARKETPLACE" >/dev/null 2>&1; then ok "removed marketplace $MARKETPLACE"; fi
 fi
 
+# The cockpit status line (`ccx statusline`) goes; a status line of your own stays.
+if command -v python3 >/dev/null; then
+  python3 -I -S - "$REPO/lib" "$STAMP" <<'PY' || true
+import sys
+sys.path.insert(0, sys.argv[1])
+from cockpit.statusline_setup import uninstall_main
+sys.exit(uninstall_main(sys.argv[2:]))
+PY
+fi
+
 if [ -L "$BIN_DIR/ccx" ] && [ "$(readlink "$BIN_DIR/ccx")" = "$REPO/bin/ccx" ]; then
   rm -f "$BIN_DIR/ccx" && ok "removed $BIN_DIR/ccx"
 fi

@@ -38,7 +38,8 @@ def is_owned(entry: object) -> bool:
 
 
 def ccx_path(repo_root: Path = REPO_ROOT, environ=os.environ) -> str:
-    """The first ccx on PATH (or in a usual bin dir) that is this install, unresolved."""
+    """The first ccx on PATH (or in a usual bin dir) that is this install, unresolved.
+    Falls back to this install's own bin/ccx (see is_stable_path)."""
     ours = os.path.realpath(repo_root / "bin" / "ccx")
     candidates = [shutil.which("ccx", path=environ.get("PATH"))]
     if environ.get("COCKPIT_BIN_DIR"):
@@ -48,6 +49,26 @@ def ccx_path(repo_root: Path = REPO_ROOT, environ=os.environ) -> str:
         if candidate and os.path.isfile(candidate) and os.path.realpath(candidate) == ours:
             return os.path.abspath(candidate)
     return str(repo_root / "bin" / "ccx")
+
+
+def is_stable_path(path: str, repo_root: Path = REPO_ROOT) -> bool:
+    """False for the fallback: a path inside this install, which moves when Homebrew
+    upgrades (Caskroom/<version>) or when the clone or worktree is deleted."""
+    named = os.path.abspath(path)   # unresolved: a link in ~/.local/bin is the stable part
+    roots = {os.path.abspath(repo_root), os.path.realpath(repo_root)}
+    return not any(named.startswith(root + os.sep) for root in roots)
+
+
+UNSTABLE_HINT = ("ccx is not on PATH, so the status line runs {path}, which breaks if this "
+                 "{kind} moves or is deleted: put ccx on PATH (e.g. ~/.local/bin), then re-run `ccx setup`")
+
+
+def unstable_kind(path: str) -> str:
+    real = os.path.realpath(path)
+    if "/Caskroom/" in real:
+        return "Homebrew version"
+    root = Path(real).parents[1]
+    return "worktree" if (root / ".git").is_file() else "checkout"
 
 
 def statusline_command(path: str) -> str:
@@ -71,7 +92,7 @@ def write_json_atomic(path: Path, data: dict) -> None:
     fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(data, indent=2) + "\n")
+            handle.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
         os.chmod(tmp, mode)
         os.replace(tmp, target)
     except BaseException:
@@ -86,7 +107,11 @@ def ensure_statusline(settings_path: Path, force: bool, stamp: str, report: Repo
                       command: str | None = None) -> str:
     """Install, refresh or keep the status line. Returns what happened:
     installed | updated | current | kept | replaced."""
-    command = command or statusline_command(ccx_path())
+    if command is None:
+        path = ccx_path()
+        command = statusline_command(path)
+    else:
+        path = None
     data = read_settings(settings_path)   # unreadable settings stop here, untouched
     current = data.get("statusLine")
     owned = is_owned(current)
@@ -97,10 +122,58 @@ def ensure_statusline(settings_path: Path, force: bool, stamp: str, report: Repo
     entry = desired(current, command)
     if current == entry:
         report.ok(f"status line up to date: {command}")
+        warn_if_unstable(path, report)
         return "current"
     if settings_path.exists():
         report.warn(f"backed up {backup(settings_path, stamp)}")
     write_json_atomic(settings_path, {**data, "statusLine": entry})
     outcome = "updated" if owned else "replaced" if current is not None else "installed"
     report.ok(f"status line {outcome}: {command} (refresh every {REFRESH_INTERVAL_S}s)")
+    warn_if_unstable(path, report)
     return outcome
+
+
+def warn_if_unstable(path: str | None, report: Report) -> None:
+    if path and not is_stable_path(path):
+        report.warn(UNSTABLE_HINT.format(path=path, kind=unstable_kind(path)))
+
+
+def command_path(command: object) -> str | None:
+    """The ccx path an owned statusLine command runs (None if it can't be parsed)."""
+    if not isinstance(command, str):
+        return None
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    if len(words) < 2 or words[-1] != "statusline":
+        return None
+    return os.path.expanduser(words[-2])
+
+
+def remove_statusline(settings_path: Path, stamp: str, report: Report) -> str:
+    """uninstall.sh: drop a cockpit-owned statusLine (after a backup). Returns
+    removed | kept | absent."""
+    if not settings_path.exists():
+        return "absent"
+    data = read_settings(settings_path)
+    current = data.get("statusLine")
+    if current is None:
+        return "absent"
+    if not is_owned(current):
+        report.ok("kept your own status line")
+        return "kept"
+    report.warn(f"backed up {backup(settings_path, stamp)}")
+    write_json_atomic(settings_path, {k: v for k, v in data.items() if k != "statusLine"})
+    report.ok(f"removed the cockpit status line from {settings_path}")
+    return "removed"
+
+
+def uninstall_main(argv: list) -> int:
+    """`python3 -I -S - LIBDIR STAMP < uninstall snippet`: never fails the uninstall."""
+    from .core import CLAUDE_HOME, CockpitError
+    try:
+        remove_statusline(CLAUDE_HOME / "settings.json", argv[0], Report())
+    except (CockpitError, OSError) as exc:
+        Report().warn(f"status line not changed: {exc}")
+    return 0

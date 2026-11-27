@@ -19,9 +19,16 @@ if sys.version_info < MIN_PYTHON:
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
 
 if __name__ == "__main__" and sys.argv[1:2] == ["statusline"]:
-    # Claude Code runs this on every status line refresh: skip the CLI's imports.
-    from cockpit.statusline import main as statusline_main  # noqa: E402
-    sys.exit(statusline_main(sys.argv[2:]))
+    # Claude Code runs this on every status line refresh: skip the CLI's imports, and
+    # never exit non-zero or print a traceback (either one blanks the status line).
+    try:
+        from cockpit.statusline import main as statusline_main  # noqa: E402
+        statusline_main(sys.argv[2:])
+    except BaseException:  # noqa: BLE001
+        if os.environ.get("COCKPIT_STATUSLINE_DEBUG"):
+            import traceback
+            traceback.print_exc()
+    sys.exit(0)
 
 from cockpit.cli import main  # noqa: E402
 

@@ -7,10 +7,12 @@ the Sandbox (test_setup.py) never lets a run reach the real ~/.claude.
 import json
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
@@ -49,6 +51,7 @@ class SetupStatuslineTests(unittest.TestCase):
         self.assertEqual(self.settings()["statusLine"],
                          {"type": "command", "command": OURS, "refreshInterval": sls.REFRESH_INTERVAL_S})
         self.assertIn("status line installed", out.stdout)
+        self.assertIn("ccx is not on PATH", out.stdout, "the sandbox has no ccx on PATH: warn about the fallback")
         self.assertEqual(self.saved(), [], "nothing to back up")
 
     def test_unset_status_line_installed_other_keys_kept_and_rerun_is_idempotent(self):
@@ -108,6 +111,13 @@ class SetupStatuslineTests(unittest.TestCase):
         self.assertEqual(self.box.settings_path.read_text(), "{ broken")
         self.assertIn("status line not changed", out.stdout)
 
+    def test_non_ascii_settings_stay_readable(self):
+        self.box.write_settings({"theme": "dark", "env": {"GREETING": "namaste 🙏 é"}})
+        self.setup_run()
+        text = self.box.settings_path.read_text(encoding="utf-8")
+        self.assertIn("namaste 🙏 é", text)
+        self.assertNotIn("\\u", text)
+
     def test_symlinked_settings_keep_their_link(self):
         real = self.box.home / "dotfiles" / "claude-settings.json"
         real.parent.mkdir()
@@ -145,6 +155,71 @@ class CombinedSetupTests(unittest.TestCase):
             self.assertIn(clone, saved[0].read_text(), "the first backup is the untouched original")
 
 
+class UninstallTests(unittest.TestCase):
+    """uninstall.sh removes only a cockpit-owned statusLine, after a backup."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.box = Sandbox(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def uninstall(self):
+        out = subprocess.run(["/bin/bash", str(ROOT / "uninstall.sh")], capture_output=True, text=True,
+                             env={**self.box.env, "COCKPIT_BIN_DIR": str(self.box.home / "bin")},
+                             timeout=120, check=False)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return out
+
+    def test_cockpit_status_line_is_removed_with_a_backup(self):
+        self.box.write_settings({"theme": "dark", "statusLine": {"type": "command", "command": OURS}})
+        out = self.uninstall()
+        self.assertEqual(json.loads(self.box.settings_path.read_text()), {"theme": "dark"})
+        (saved,) = backups(self.box.settings_path.parent, "settings.json")
+        self.assertIn("statusLine", json.loads(saved.read_text()))
+        self.assertIn("removed the cockpit status line", out.stdout)
+
+    def test_own_status_line_missing_or_broken_settings_are_left_alone(self):
+        self.box.write_settings({"statusLine": FOREIGN})
+        before = self.box.settings_path.read_text()
+        self.assertIn("kept your own status line", self.uninstall().stdout)
+        self.assertEqual(self.box.settings_path.read_text(), before)
+        self.box.settings_path.write_text("{ broken")
+        self.assertIn("status line not changed", self.uninstall().stdout)
+        self.assertEqual(self.box.settings_path.read_text(), "{ broken")
+        self.box.settings_path.unlink()
+        self.uninstall()
+        self.assertFalse(self.box.settings_path.exists(), "uninstall never creates settings")
+        self.assertEqual(backups(self.box.settings_path.parent, "settings.json"), [])
+
+
+class DoctorStatuslineTests(unittest.TestCase):
+    def check(self, settings, home):
+        from cockpit import doctor_cmd
+        if settings is not None:
+            (home / "settings.json").write_text(json.dumps(settings))
+        ctx = mock.Mock(claude_home=home)
+        return doctor_cmd.check_statusline(ctx)[0]
+
+    def test_missing_ccx_fails_and_the_other_states(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self.assertEqual(self.check(None, home).status, "warn")
+            self.assertEqual(self.check({"statusLine": FOREIGN}, home).status, "ok")
+            gone = {"statusLine": {"type": "command", "command": "python3 -I -S /gone/1.6.0/bin/ccx statusline"}}
+            result = self.check(gone, home)
+            self.assertEqual(result.status, "fail")
+            self.assertIn("/gone/1.6.0/bin/ccx", result.label)
+            inside = self.check({"statusLine": {"type": "command", "command": OURS}}, home)
+            self.assertEqual(inside.status, "warn", "a path inside the install moves on upgrade")
+            link = home / "ccx"
+            link.symlink_to(ROOT / "bin" / "ccx")
+            stable = self.check({"statusLine": {"type": "command", "command": f"python3 -I -S {link} statusline"}},
+                                home)
+            self.assertEqual(stable.status, "ok")
+
+
 class CommandPathTests(unittest.TestCase):
     def test_a_stable_link_on_path_wins_over_the_resolved_install(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -157,6 +232,14 @@ class CommandPathTests(unittest.TestCase):
             (other / "ccx").chmod(0o755)
             self.assertNotEqual(sls.ccx_path(ROOT, {"PATH": str(other)}), str(other / "ccx"),
                                 "a different ccx on PATH is not ours")
+
+    def test_fallback_path_is_flagged_unstable(self):
+        repo_path = str(ROOT / "bin" / "ccx")
+        self.assertFalse(sls.is_stable_path(repo_path))
+        self.assertTrue(sls.is_stable_path("/opt/homebrew/bin/ccx"))
+        self.assertEqual(sls.unstable_kind("/opt/homebrew/Caskroom/claude-cockpit/1.6.0/bin/ccx"), "Homebrew version")
+        self.assertEqual(sls.command_path("python3 -I -S '/a b/ccx' statusline"), "/a b/ccx")
+        self.assertIsNone(sls.command_path("python3 'unclosed"))
 
     def test_ownership_is_recognised_by_pattern(self):
         for command in ("ccx statusline", "/opt/homebrew/bin/ccx statusline", "'/a b/ccx' statusline",

@@ -13,6 +13,7 @@ leaves its segment out. Nothing here talks to the network.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -29,7 +30,6 @@ from .pricing import request_cost
 CLAUDE_HOME = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")))   # core.CLAUDE_HOME
 SESSIONS_DIR = CLAUDE_HOME / "sessions"                                                    # core.SESSIONS_DIR
 ASSISTANT_RE = re.compile(rb'"type":\s*"assistant"')                                       # team.ASSISTANT_RE
-FIRST_READ_MAX_BYTES = 64 * 1024 * 1024                                                    # team.FIRST_READ_MAX_BYTES
 STALL_SECONDS = 300                                                                        # team.STALL_SECONDS
 
 
@@ -58,18 +58,22 @@ def read_meta(path: Path) -> dict:
     return load_json(path)
 
 
-STATE_VERSION = 1
+STATE_VERSION = 2            # 2: offsets carry the inode and a mid-line flag
+CHUNK_BYTES = 4 * 1024 * 1024               # most bytes one read takes from one transcript
+AGENT_FIRST_READ_MAX_BYTES = 8 * 1024 * 1024  # an agent's first read starts this far from the end
 GIT_TTL_S = 10.0
 GIT_TIMEOUT_S = 0.3
 MAIN_FIRST_READ_MAX_BYTES = 4 * 1024 * 1024   # the cache segment only needs recent calls
 RECENT_CALLS = 10
 AGENT_READ_BUDGET_S = 0.15                    # per render; the rest is read on the next one
+CHECKPOINT_EVERY_S = 0.02                     # many small agents: don't rewrite state after each one
 TTL_SECONDS = {"5m": 300, "1h": 3600}
 SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
 DEFAULT_ALERT_PCT = 60.0
 SAME_WINDOW_SLACK_S = 3600   # resets_at jitters a little between responses
 MARKER_MAX_AGE_S = 2 * 86400
 STATE_MAX_AGE_S = 7 * 86400
+TMP_MAX_AGE_S = 3600
 
 
 # ---------------------------------------------------------------- state files
@@ -112,7 +116,8 @@ def save_json(path: Path, data: dict) -> None:
 
 
 def prune_state(directory: Path, max_age_s: float = STATE_MAX_AGE_S) -> int:
-    """Delete session and git state untouched for MAX_AGE_S; runs at most once a day."""
+    """Delete session and git state untouched for MAX_AGE_S, and temp files a killed
+    render left behind (older than an hour); runs at most once a day."""
     stamp = directory / ".pruned"
     now = time.time()
     try:
@@ -120,8 +125,10 @@ def prune_state(directory: Path, max_age_s: float = STATE_MAX_AGE_S) -> int:
             return 0
         stamp.touch()
         removed = 0
-        for path in [*directory.glob("session-*.json"), *directory.glob("git-*.json")]:
-            if now - path.stat().st_mtime > max_age_s:
+        aged = [(p, max_age_s) for p in [*directory.glob("session-*.json"), *directory.glob("git-*.json")]]
+        aged += [(p, TMP_MAX_AGE_S) for p in directory.glob(".*.tmp")]
+        for path, limit in aged:
+            if now - path.stat().st_mtime > limit:
                 path.unlink()
                 removed += 1
     except OSError:
@@ -156,7 +163,8 @@ def run_git_status(cwd: str, timeout: float = GIT_TIMEOUT_S) -> tuple[str, dict 
     import subprocess  # only when the cache is stale: keeps the common render fast
     argv = ["git", "--no-optional-locks", "-C", cwd, "status", "--porcelain=v2", "--branch"]
     try:
-        out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False,
+        out = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                             timeout=timeout, check=False,
                              stdin=subprocess.DEVNULL, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
     except subprocess.TimeoutExpired:
         return "timeout", None
@@ -174,14 +182,14 @@ def head_branch(cwd: str) -> str | None:
         dotgit = folder / ".git"
         try:
             if dotgit.is_file():
-                text = dotgit.read_text(encoding="utf-8").strip()
+                text = dotgit.read_text(encoding="utf-8", errors="replace").strip()
                 if not text.startswith("gitdir:"):
                     return None
                 gitdir = Path(text[len("gitdir:"):].strip())
                 dotgit = gitdir if gitdir.is_absolute() else folder / gitdir
             elif not dotgit.is_dir():
                 continue
-            head = (dotgit / "HEAD").read_text(encoding="utf-8").strip()
+            head = (dotgit / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             return None
         prefix = "ref: refs/heads/"
@@ -211,35 +219,53 @@ def git_info(cwd: str, directory: Path | None, now: float, runner=run_git_status
 
 # ---------------------------------------------------------------- transcripts
 
-def read_new_lines(path: Path, offset: int, first_cap: int) -> tuple:
-    """Complete lines appended since OFFSET: (lines, new offset, skipped head, mtime, restarted).
+def read_chunk(path: Path, cursor: dict, first_cap: int, chunk_max: int | None = None,
+               catch_up: bool = False) -> tuple:
+    """At most CHUNK_MAX bytes of whole lines after CURSOR: (lines, new cursor, info).
 
-    Only whole lines are consumed, so the saved offset never splits a record."""
+    cursor = {"offset", "ino", "cut"}: "cut" means the offset sits inside a line whose
+    head was skipped, so everything up to the next newline is dropped. A first read
+    (or, with CATCH_UP, any read further behind than FIRST_CAP) starts FIRST_CAP from
+    the end. A new inode or a shorter file starts over. info = {"mtime", "skipped",
+    "restarted", "behind"}; behind is how many bytes are still unread."""
     try:
-        info = path.stat()
+        stat = path.stat()
     except OSError:
-        return [], offset, False, 0, False
-    size, mtime = info.st_size, int(info.st_mtime)
-    restarted = size < offset          # rewritten: start over
+        return [], dict(cursor), {"mtime": 0, "skipped": False, "restarted": False, "behind": 0}
+    size, ino, mtime = stat.st_size, stat.st_ino, int(stat.st_mtime)
+    chunk_max = chunk_max or CHUNK_BYTES
+    offset, cut = int(cursor.get("offset") or 0), bool(cursor.get("cut"))
+    restarted = (cursor.get("ino") not in (None, ino)) or size < offset
     if restarted:
-        offset = 0
-    if size == offset:
-        return [], offset, False, mtime, restarted
-    skipped = offset == 0 and size > first_cap
-    start = size - first_cap if skipped else offset
+        offset, cut = 0, False
+    fresh = restarted or "ino" not in cursor
+    skipped = (fresh or catch_up) and size - offset > first_cap
+    if skipped:
+        offset, cut = size - first_cap, True
+
+    def result(lines: list, new_offset: int, new_cut: bool) -> tuple:
+        return lines, {"offset": new_offset, "ino": ino, "cut": new_cut}, \
+            {"mtime": mtime, "skipped": skipped, "restarted": restarted, "behind": max(0, size - new_offset)}
+
+    if offset >= size:
+        return result([], size, cut)
     try:
         with path.open("rb") as handle:
-            handle.seek(start)
-            chunk = handle.read(size - start)
+            handle.seek(offset)
+            chunk = handle.read(min(chunk_max, size - offset))
     except OSError:
-        return [], offset, False, mtime, restarted
+        return result([], offset, cut)
+    base, full = offset, len(chunk) == chunk_max
+    if cut:
+        newline = chunk.find(b"\n")
+        if newline < 0:                 # still inside the skipped line
+            return result([], base + len(chunk), True)
+        chunk, base = chunk[newline + 1:], base + newline + 1
     end = chunk.rfind(b"\n")
     if end < 0:
-        return [], offset, False, mtime, restarted
-    lines = chunk[:end].split(b"\n")
-    if skipped and lines:
-        lines.pop(0)           # probably cut mid-line
-    return lines, start + end + 1, skipped, mtime, restarted
+        # A line longer than a whole chunk is dropped; a short tail waits for its newline.
+        return result([], base + len(chunk), True) if full and chunk else result([], base, False)
+    return result(chunk[:end].split(b"\n"), base + end + 1, False)
 
 
 def assistant_records(lines: list[bytes]):
@@ -271,10 +297,13 @@ def call_ttl(usage: dict) -> str | None:
 
 
 def update_main(state: dict, path: Path) -> dict:
-    """Fold new main-transcript calls into STATE: recent cache reads and the last call's TTL."""
-    lines, offset, _, _, restarted = read_new_lines(
-        path, int(state.get("offset") or 0) if state.get("path") == str(path) else 0, MAIN_FIRST_READ_MAX_BYTES)
-    if restarted or state.get("path") != str(path):
+    """Fold new main-transcript calls into STATE: recent cache reads and the last call's TTL.
+    Only the newest MAIN_FIRST_READ_MAX_BYTES matter, so a long backlog is skipped."""
+    same = state.get("path") == str(path)
+    cursor = state.get("cursor") if same and isinstance(state.get("cursor"), dict) else {}
+    lines, cursor, info = read_chunk(path, cursor, MAIN_FIRST_READ_MAX_BYTES, MAIN_FIRST_READ_MAX_BYTES,
+                                     catch_up=True)
+    if info["restarted"] or not same:
         state = {}
     recent = [r for r in state.get("recent") or [] if isinstance(r, list) and len(r) == 3]
     last_ts, ttl = state.get("last_ts"), state.get("ttl")
@@ -290,7 +319,7 @@ def update_main(state: dict, path: Path) -> dict:
         ts = parse_ts(record.get("timestamp"))
         last_ts = ts if ts is not None else last_ts
         ttl = call_ttl(usage) or ttl
-    return {"path": str(path), "offset": offset, "recent": recent[-RECENT_CALLS:], "last_ts": last_ts, "ttl": ttl}
+    return {"path": str(path), "cursor": cursor, "recent": recent[-RECENT_CALLS:], "last_ts": last_ts, "ttl": ttl}
 
 
 def cache_from_main(state: dict) -> dict | None:
@@ -303,10 +332,10 @@ def cache_from_main(state: dict) -> dict | None:
 
 
 def update_agent(state: dict, path: Path) -> dict:
-    """Running API-equivalent cost of one agent transcript, read incrementally."""
-    lines, offset, skipped, mtime, restarted = read_new_lines(path, int(state.get("offset") or 0),
-                                                              FIRST_READ_MAX_BYTES)
-    if restarted:
+    """One bounded chunk more of an agent transcript's API-equivalent cost."""
+    cursor = state.get("cursor") if isinstance(state.get("cursor"), dict) else {}
+    lines, cursor, info = read_chunk(path, cursor, AGENT_FIRST_READ_MAX_BYTES)
+    if info["restarted"]:
         state = {"finished": state.get("finished")}
     cost, known, model = float(state.get("cost") or 0.0), bool(state.get("known", True)), str(state.get("model") or "")
     last_id, last_cost, last_out = state.get("last_id") or "", float(state.get("last_cost") or 0.0), \
@@ -327,13 +356,18 @@ def update_agent(state: dict, path: Path) -> dict:
         else:
             cost += price
         last_id, last_cost, last_out = rid, price or 0.0, out
-    return {"offset": offset, "mtime": mtime, "cost": cost, "known": known,
-            "partial": bool(state.get("partial")) or skipped, "last_id": last_id, "last_cost": last_cost,
+    return {"cursor": cursor, "behind": info["behind"], "mtime": info["mtime"], "cost": cost, "known": known,
+            "partial": bool(state.get("partial")) or info["skipped"], "last_id": last_id, "last_cost": last_cost,
             "last_out": last_out, "model": model, "finished": bool(state.get("finished"))}
 
 
-def agents_summary(states: dict, session_dir: Path, now: float, budget_s: float = AGENT_READ_BUDGET_S) -> tuple:
-    """(new states, summary dict | None) for the agents under SESSION_DIR/subagents."""
+def agents_summary(states: dict, session_dir: Path, now: float, budget_s: float = AGENT_READ_BUDGET_S,
+                   checkpoint=None) -> tuple:
+    """(new states, summary dict | None) for the agents under SESSION_DIR/subagents.
+
+    Each agent gets one bounded chunk per pass, passes repeat while the time budget
+    lasts, and CHECKPOINT(states) runs after a chunk that read something (at most every
+    CHECKPOINT_EVERY_S), so a render that Claude Code cancels keeps its progress."""
     folder = session_dir / "subagents"
     try:
         metas = sorted(folder.glob("agent-*.meta.json"))
@@ -342,27 +376,45 @@ def agents_summary(states: dict, session_dir: Path, now: float, budget_s: float 
     if not metas:
         return states, None
     deadline = time.monotonic() + budget_s
-    fresh, running, done, stalled, cost, partial = {}, 0, 0, 0, 0.0, False
+    saved_at = time.monotonic()
+    fresh, finished = {}, {}
     for meta_path in metas:
         aid = meta_path.name[len("agent-"):-len(".meta.json")]
         old = states.get(aid) if isinstance(states.get(aid), dict) else {}
-        finished = bool(old.get("finished")) or bool(read_meta(meta_path).get("finished"))
-        transcript = folder / f"agent-{aid}.jsonl"
-        if time.monotonic() < deadline:
-            new = update_agent(old, transcript)
-        else:
-            new, partial = dict(old), True   # out of time: count it next render
-        new["finished"] = finished
-        fresh[aid] = new
-        cost += float(new.get("cost") or 0.0)
-        partial = partial or bool(new.get("partial")) or not new.get("known", True)
-        if finished:
+        finished[aid] = bool(old.get("finished")) or bool(read_meta(meta_path).get("finished"))
+        fresh[aid] = {**old, "finished": finished[aid]}
+    pending = list(fresh)
+    while pending and time.monotonic() < deadline:
+        behind = []
+        for aid in pending:
+            if time.monotonic() >= deadline:
+                break
+            before = fresh[aid].get("cursor")
+            fresh[aid] = {**update_agent(fresh[aid], folder / f"agent-{aid}.jsonl"), "finished": finished[aid]}
+            if (checkpoint is not None and fresh[aid].get("cursor") != before
+                    and time.monotonic() - saved_at >= CHECKPOINT_EVERY_S):
+                checkpoint(fresh)
+                saved_at = time.monotonic()
+            if fresh[aid].get("behind"):
+                behind.append(aid)
+        pending = behind
+    return fresh, summarize_agents(fresh, now)
+
+
+def summarize_agents(states: dict, now: float) -> dict:
+    running = done = stalled = 0
+    cost, partial = 0.0, False
+    for state in states.values():
+        cost += float(state.get("cost") or 0.0)
+        partial = (partial or bool(state.get("partial")) or not state.get("known", True)
+                   or "cursor" not in state or bool(state.get("behind")))
+        if state.get("finished"):
             done += 1
-        elif new.get("mtime") and now - new["mtime"] > STALL_SECONDS:
+        elif state.get("mtime") and now - state["mtime"] > STALL_SECONDS:
             stalled += 1
         else:
             running += 1
-    return fresh, {"running": running, "done": done, "stalled": stalled, "cost": cost, "partial": partial}
+    return {"running": running, "done": done, "stalled": stalled, "cost": cost, "partial": partial}
 
 
 def transcript_facts(payload_path: str, session_id: str, directory: Path | None, now: float) -> dict:
@@ -375,10 +427,14 @@ def transcript_facts(payload_path: str, session_id: str, directory: Path | None,
     if state.get("v") != STATE_VERSION:
         state = {}
     main = update_main(state.get("main") if isinstance(state.get("main"), dict) else {}, path)
+
+    def checkpoint(agents_state: dict) -> None:
+        if cache_file:
+            save_json(cache_file, {"v": STATE_VERSION, "main": main, "agents": agents_state})
+
     agents_state = state.get("agents") if isinstance(state.get("agents"), dict) else {}
-    agents_state, agents = agents_summary(agents_state, path.with_suffix(""), now)
-    if cache_file:
-        save_json(cache_file, {"v": STATE_VERSION, "main": main, "agents": agents_state})
+    agents_state, agents = agents_summary(agents_state, path.with_suffix(""), now, checkpoint=checkpoint)
+    checkpoint(agents_state)
     return {"cache": cache_from_main(main), "agents": agents}
 
 
@@ -412,6 +468,58 @@ def waiting_sessions(current_id: str, directory: Path = SESSIONS_DIR, alive=pid_
         if alive(pid):
             names.append(str(record.get("name") or f"pid-{pid}"))
     return names
+
+
+# ---------------------------------------------------------------- GSD context bridge
+# gsd-context-monitor.js (a PostToolUse hook from the GSD toolkit) warns the agent
+# when context runs low. It reads what the GSD status line used to write:
+#   <os.tmpdir()>/claude-ctx-<session_id>.json
+#   {"session_id", "remaining_percentage", "used_pct", "timestamp"}
+# remaining_percentage is Claude Code's raw value (its thresholds: <= 35 warning,
+# <= 25 critical); used_pct = Math.round(100 - remaining), also raw, not rescaled
+# for the autocompact buffer; timestamp is epoch seconds (older than 60s is ignored).
+
+GSD_MONITOR = Path("hooks") / "gsd-context-monitor.js"
+
+
+def node_tmpdir(environ=os.environ) -> str:
+    """Node's os.tmpdir() on POSIX: TMPDIR, TMP, TEMP or /tmp, without a trailing slash."""
+    path = environ.get("TMPDIR") or environ.get("TMP") or environ.get("TEMP") or "/tmp"
+    return path.rstrip("/") or "/"
+
+
+def js_round(value: float) -> int:
+    """Math.round: halves round up, unlike Python's round()."""
+    return int(math.floor(value + 0.5))
+
+
+def write_context_bridge(payload: dict, environ=os.environ, claude_home: Path = CLAUDE_HOME,
+                         now: float | None = None) -> Path | None:
+    """Write the bridge file when the GSD monitor hook is installed. Returns its path."""
+    session_id = payload.get("session_id")
+    window = payload.get("context_window") if isinstance(payload.get("context_window"), dict) else {}
+    remaining = window.get("remaining_percentage")
+    if (not isinstance(session_id, str) or not SAFE_ID.fullmatch(session_id) or ".." in session_id
+            or isinstance(remaining, bool) or not isinstance(remaining, (int, float))
+            or not (claude_home / GSD_MONITOR).is_file()):
+        return None
+    target = Path(node_tmpdir(environ)) / f"claude-ctx-{session_id}.json"
+    record = {"session_id": session_id, "remaining_percentage": remaining, "used_pct": js_round(100 - remaining),
+              "timestamp": int(time.time() if now is None else now)}
+    # O_EXCL on a fresh name (tempfile would add ~15ms of imports): never follows a planted link.
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(record))
+        os.replace(tmp, target)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return None
+    return target
 
 
 # ---------------------------------------------------------------- usage alert

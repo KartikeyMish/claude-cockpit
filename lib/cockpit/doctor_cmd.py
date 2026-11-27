@@ -234,6 +234,28 @@ def check_terminal(ctx: Context) -> list[Check]:
     return checks + [Check("ghostty-config", valid, "Ghostty config valid", detail)]
 
 
+def check_statusline(ctx: Context) -> list[Check]:
+    """The cockpit status line is installed and its ccx path still exists."""
+    from .statusline_setup import FORCE_HINT, command_path, is_owned, is_stable_path
+    try:
+        data = json.loads((ctx.claude_home / "settings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    entry = data.get("statusLine") if isinstance(data, dict) else None
+    if entry is None:
+        return [Check("statusline", WARN, "cockpit status line not installed", "run: ccx setup")]
+    if not is_owned(entry):
+        return [Check("statusline", OK, "status line: your own (kept)", FORCE_HINT)]
+    path = command_path(entry.get("command"))
+    if not path or not os.path.isfile(path):
+        missing = path or entry.get("command")
+        return [Check("statusline", FAIL, f"status line runs a ccx that no longer exists: {missing}", "run: ccx setup")]
+    if not is_stable_path(path):
+        return [Check("statusline", WARN, f"status line runs {short_path(path)}, inside this install",
+                      "put ccx on PATH, then run: ccx setup")]
+    return [Check("statusline", OK, f"cockpit status line ({short_path(path)})")]
+
+
 def check_sessions(ctx: Context) -> list[Check]:
     if not (ctx.claude_home / "sessions").is_dir():
         return [Check("sessions", WARN, "session registry",
@@ -256,7 +278,7 @@ def check_sessions(ctx: Context) -> list[Check]:
 
 
 GATHER = (check_claude, check_plugin, check_install, check_hooks, check_policy, check_switches,
-          check_data_dir, check_overrides, check_terminal, check_sessions)
+          check_data_dir, check_overrides, check_statusline, check_terminal, check_sessions)
 
 
 def gather(ctx: Context, checks=GATHER) -> list[Check]:

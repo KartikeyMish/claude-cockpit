@@ -48,7 +48,6 @@ class SharedConstantsTests(unittest.TestCase):
 
     def test_copies_match_team_and_core(self):
         self.assertEqual(data.ASSISTANT_RE.pattern, team.ASSISTANT_RE.pattern)
-        self.assertEqual(data.FIRST_READ_MAX_BYTES, team.FIRST_READ_MAX_BYTES)
         self.assertEqual(data.STALL_SECONDS, team.STALL_SECONDS)
         self.assertEqual(data.CLAUDE_HOME, core.CLAUDE_HOME)
         self.assertEqual(data.SESSIONS_DIR, core.SESSIONS_DIR)
@@ -78,6 +77,17 @@ class StateDirTests(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in folder.iterdir()), [".pruned", "git-fresh.json"])
             os.utime(fresh, (time.time() - 30 * 86400,) * 2)
             self.assertEqual(data.prune_state(folder), 0, "already pruned today")
+
+    def test_leftover_temp_files_older_than_an_hour_are_pruned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            stale, live = folder / ".session-a.json.99.tmp", folder / ".session-b.json.98.tmp"
+            stale.write_text("{")
+            live.write_text("{")
+            os.utime(stale, (time.time() - 2 * 3600,) * 2)
+            data.prune_state(folder)
+            self.assertFalse(stale.exists())
+            self.assertTrue(live.exists(), "a render may still be writing it")
 
     def test_corrupt_state_is_ignored_and_writes_are_atomic(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -129,6 +139,17 @@ class GitTests(unittest.TestCase):
             self.assertEqual((info["branch"], info["dirty"]), ("slow-repo", None))
             data.git_info(tmp, state, 2.0, slow)
             self.assertEqual(len(calls), 1, "a timeout is cached too, so a slow repo costs one wait per 10s")
+
+    @unittest.skipUnless(shutil.which("git"), "git not installed")
+    def test_non_utf8_branch_names_do_not_raise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null"}
+            subprocess.run(["git", "init", "-q", tmp], env=env, check=True)
+            subprocess.run(["git", "-C", tmp, "symbolic-ref", "HEAD", b"refs/heads/caf\xe9"], env=env, check=True)
+            status, info = data.run_git_status(tmp, timeout=5)
+            self.assertEqual(status, "ok")
+            self.assertEqual(info["branch"], "caf\ufffd")
+            self.assertEqual(data.head_branch(tmp), "caf\ufffd", "the slow-git fallback decodes the same way")
 
     def test_outside_a_repo_and_missing_directory_give_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -194,11 +215,11 @@ class TranscriptTests(unittest.TestCase):
         write_lines(self.main, [assistant("m1", usage(read=0, write=1000))])
         state = data.update_main({}, self.main)
         size = self.main.stat().st_size
-        self.assertEqual(state["offset"], size)
+        self.assertEqual(state["cursor"]["offset"], size)
         with open(self.main, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(assistant("m2", usage(inp=0, read=1000)))[:40])   # still being written
         state = data.update_main(state, self.main)
-        self.assertEqual(state["offset"], size, "an unfinished line is left for the next render")
+        self.assertEqual(state["cursor"]["offset"], size, "an unfinished line is left for the next render")
         self.assertEqual(len(state["recent"]), 1)
         with open(self.main, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(assistant("m2", usage(inp=0, read=1000)))[40:] + "\n")
@@ -206,6 +227,16 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual([r[0] for r in state["recent"]], ["m1", "m2"])
         self.main.write_text("")   # rewritten (e.g. /clear): starts over
         self.assertEqual(data.update_main(state, self.main)["recent"], [])
+
+    def test_a_replaced_file_with_a_new_inode_starts_over(self):
+        write_lines(self.main, [assistant("m1", usage(read=0, write=1000)), assistant("m2", usage(read=10))])
+        state = data.update_main({}, self.main)
+        replacement = self.dir / "new.jsonl"
+        write_lines(replacement, [assistant("n1", usage(read=0, write=1000)), assistant("n2", usage(read=10)),
+                                  assistant("n3", usage(read=20))])
+        os.replace(replacement, self.main)   # bigger file, new inode: an offset would land mid-record
+        state = data.update_main(state, self.main)
+        self.assertEqual([r[0] for r in state["recent"]], ["n1", "n2", "n3"])
 
     def test_agents_running_done_stalled_and_cost_without_double_counting(self):
         write_lines(self.main, [assistant("m1", usage())])
@@ -256,6 +287,102 @@ class TranscriptTests(unittest.TestCase):
                          "an unsafe session id is never used as a file name")
 
 
+class BoundedReadTests(unittest.TestCase):
+    """Large transcripts: bounded bytes per read, steady progress, progress kept if a render dies."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.agents = self.dir / "sess" / "subagents"
+        self.agents.mkdir(parents=True)
+        self.patch = mock.patch.multiple(data, CHUNK_BYTES=64 * 1024, AGENT_FIRST_READ_MAX_BYTES=512 * 1024,
+                                         MAIN_FIRST_READ_MAX_BYTES=128 * 1024, CHECKPOINT_EVERY_S=0)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def big_agent(self, name, megabytes, filler=2000):
+        """MEGABYTES of transcript: an assistant call of 1 output token after every filler line."""
+        path = self.agents / f"agent-{name}.jsonl"
+        pad = json.dumps({"type": "user", "message": {"content": "x" * filler}})
+        with open(path, "w", encoding="utf-8") as handle:
+            i = 0
+            while handle.tell() < megabytes * 1024 * 1024:
+                handle.write(pad + "\n" + json.dumps(assistant(f"{name}-{i}", usage(inp=0, out=1))) + "\n")
+                i += 1
+        (self.agents / f"agent-{name}.meta.json").write_text(json.dumps({"finished": True}))
+        return path
+
+    def test_each_read_is_bounded_and_the_backlog_drains_across_calls(self):
+        path = self.big_agent("a", 2)
+        size = path.stat().st_size
+        cursor, offsets = {}, []
+        for _ in range(20):
+            before = int(cursor.get("offset") or 0)
+            _, cursor, info = data.read_chunk(path, cursor, data.AGENT_FIRST_READ_MAX_BYTES)
+            if offsets:
+                self.assertLessEqual(cursor["offset"] - before, data.CHUNK_BYTES)
+            offsets.append(cursor["offset"])
+            if not info["behind"]:
+                break
+        self.assertEqual(offsets[-1], size)
+        self.assertGreaterEqual(offsets[0], size - data.AGENT_FIRST_READ_MAX_BYTES, "first read starts near the end")
+        self.assertEqual(offsets, sorted(offsets))
+
+    def test_first_read_is_capped_marked_partial_and_progress_survives_a_cancelled_render(self):
+        self.big_agent("a", 2)
+        self.big_agent("b", 2)
+        saved = []
+        states, summary = data.agents_summary({}, self.dir / "sess", time.time(), budget_s=60,
+                                               checkpoint=lambda s: saved.append(json.loads(json.dumps(s))))
+        self.assertTrue(summary["partial"], "the head of each 2 MiB file was skipped")
+        self.assertFalse(any(s.get("behind") for s in states.values()))
+        self.assertGreaterEqual(len(saved), 2 * data.AGENT_FIRST_READ_MAX_BYTES // data.CHUNK_BYTES - 2,
+                                "a checkpoint after every chunk")
+        first = saved[0]
+        self.assertTrue(any(s.get("cursor") for s in first.values()), "progress is on disk after one chunk")
+        # A render that died after its first checkpoint resumes from it instead of starting over.
+        states2, _ = data.agents_summary(first, self.dir / "sess", time.time(), budget_s=60)
+        self.assertAlmostEqual(sum(s["cost"] for s in states2.values()), sum(s["cost"] for s in states.values()))
+
+    def test_time_budget_is_checked_between_chunks(self):
+        self.big_agent("a", 2)
+        clock = iter(i * 0.01 for i in range(10_000))   # every clock read costs 10ms
+        with mock.patch.object(data.time, "monotonic", lambda: next(clock)):
+            states, summary = data.agents_summary({}, self.dir / "sess", time.time(), budget_s=0.1)
+        self.assertGreater(states["a"]["cursor"]["offset"], 0, "some chunks were read")
+        self.assertTrue(states["a"]["behind"], "stopped mid-file when the budget ran out")
+        self.assertTrue(summary["partial"])
+
+    def test_a_line_longer_than_a_chunk_is_skipped_not_looped_on(self):
+        path = self.agents / "agent-huge.jsonl"
+        write_lines(path, [assistant("r0", usage(out=1)), {"type": "user", "message": {"content": "y" * 300_000}},
+                           assistant("r1", usage(out=1))])
+        state = {}
+        for _ in range(10):
+            state = data.update_agent(state, path)
+            if not state["behind"]:
+                break
+        self.assertEqual(state["behind"], 0)
+        self.assertAlmostEqual(state["cost"], 2 * request_cost(MODEL, usage(out=1)))
+
+    def test_main_transcript_skips_a_long_backlog(self):
+        main = self.dir / "sess.jsonl"
+        write_lines(main, [assistant("old", usage(read=0, write=1000))])
+        state = data.update_main({}, main)
+        with open(main, "a", encoding="utf-8") as handle:
+            for i in range(400):
+                handle.write(json.dumps({"type": "user", "message": {"content": "z" * 2000}}) + "\n")
+            handle.write(json.dumps(assistant("new", usage(inp=0, read=500))) + "\n")
+        before = state["cursor"]["offset"]
+        state = data.update_main(state, main)
+        self.assertEqual(state["cursor"]["offset"], main.stat().st_size, "caught up in one bounded read")
+        self.assertGreater(main.stat().st_size - before, data.MAIN_FIRST_READ_MAX_BYTES)
+        self.assertEqual(state["recent"][-1][0], "new")
+
+
 class WaitingSessionsTests(unittest.TestCase):
     def test_only_other_live_interactive_waiting_sessions_count(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -275,6 +402,65 @@ class WaitingSessionsTests(unittest.TestCase):
             self.assertEqual(names, ["api@main"])
         self.assertEqual(data.waiting_sessions("me", Path("/no/such/dir")), [])
         self.assertTrue(data.pid_alive(os.getpid()))
+
+
+class ContextBridgeTests(unittest.TestCase):
+    """The file gsd-context-monitor.js reads (see the comment above write_context_bridge)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name) / "claude"
+        self.out = Path(self.tmp.name) / "tmp"
+        self.out.mkdir()
+        self.env = {"TMPDIR": str(self.out) + "/"}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def install_monitor(self):
+        (self.home / "hooks").mkdir(parents=True)
+        (self.home / "hooks" / "gsd-context-monitor.js").write_text("// consumer\n")
+
+    def write(self, session="0b9c-uuid", remaining=33.5):
+        payload = {"session_id": session, "context_window": {"remaining_percentage": remaining}}
+        return data.write_context_bridge(payload, self.env, self.home, now=1_800_000_123.9)
+
+    def test_written_only_when_the_monitor_hook_is_installed(self):
+        self.assertIsNone(self.write())
+        self.assertEqual(list(self.out.iterdir()), [])
+        self.install_monitor()
+        path = self.write()
+        self.assertEqual(path, self.out / "claude-ctx-0b9c-uuid.json")
+        self.assertEqual(json.loads(path.read_text()), {"session_id": "0b9c-uuid", "remaining_percentage": 33.5,
+                                                        "used_pct": 67, "timestamp": 1_800_000_123})
+        self.assertEqual([p.name for p in self.out.iterdir()], [path.name], "no temp file left behind")
+
+    def test_same_rounding_and_tmpdir_rules_as_node(self):
+        self.assertEqual([data.js_round(x) for x in (66.5, 67.5, 0.5, 66.49)], [67, 68, 1, 66])
+        self.assertEqual(data.node_tmpdir({}), "/tmp")
+        self.assertEqual(data.node_tmpdir({"TMP": "/a/"}), "/a")
+        self.assertEqual(data.node_tmpdir({"TMPDIR": "/b/", "TMP": "/a"}), "/b")
+
+    def test_unsafe_ids_and_missing_values_write_nothing(self):
+        self.install_monitor()
+        for session, remaining in (("../x", 30), ("a/b", 30), ("a..b", 30), ("", 30), (None, 30),
+                                   ("ok", None), ("ok", True), ("ok", "30")):
+            self.assertIsNone(self.write(session, remaining), (session, remaining))
+        self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_a_planted_symlink_is_replaced_not_followed(self):
+        self.install_monitor()
+        victim = Path(self.tmp.name) / "victim.txt"
+        victim.write_text("keep")
+        (self.out / "claude-ctx-s1.json").symlink_to(victim)
+        self.write("s1")
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertFalse((self.out / "claude-ctx-s1.json").is_symlink())
+
+    def test_unwritable_tmpdir_is_not_an_error(self):
+        self.install_monitor()
+        self.env = {"TMPDIR": str(Path(self.tmp.name) / "missing")}
+        self.assertIsNone(self.write())
 
 
 class UsageAlertTests(unittest.TestCase):

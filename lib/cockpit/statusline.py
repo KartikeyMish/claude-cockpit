@@ -30,6 +30,7 @@ TICKET_RE = re.compile(r"^[A-Za-z]+[0-9]*-[0-9]+")
 BRANCH_MAX = 20
 CTX_BAR, USAGE_BAR = 10, 6
 EDGE_COLUMNS = 4   # docs: keep lines at least four columns narrower than the terminal
+DEFAULT_COLUMNS = 120
 
 GREEN, YELLOW, ORANGE, RED, DIM, BOLD = "32", "33", "38;5;208", "31", "2", "1"
 BRANCH_COLOUR, BLINK_RED = "38;5;141", "5;31"
@@ -51,6 +52,14 @@ def number(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+def epoch_s(value: object) -> float | None:
+    """Epoch seconds, also when a payload sends milliseconds."""
+    seconds = number(value)
+    if seconds is not None and seconds > 1e11:
+        seconds /= 1000
+    return seconds
 
 
 def section(payload: dict, key: str) -> dict:
@@ -187,7 +196,7 @@ def usage_segment(payload: dict, now: float) -> Segment | None:
     week = paint(f"7d {pct7:.0f}%", usage_colour(pct7)) if pct7 is not None else ""
     if pct5 is None:
         return Segment(90, week) if week else None
-    resets = number(five.get("resets_at"))
+    resets = epoch_s(five.get("resets_at"))
     countdown = paint(f" ↻{span(resets - now)}", DIM) if resets and resets > now else ""
     head = paint(f"5h {bar(pct5, USAGE_BAR)} {pct5:.0f}%", usage_colour(pct5))
     full = head + countdown + (" · " + week if week else "")
@@ -202,10 +211,10 @@ def cache_view(payload: dict, facts: dict) -> tuple[float | None, float | None, 
     hit = number(recent.get("hit_pct"))
     if hit is None and number(cache.get("hit_ratio")) is not None:
         hit = 100.0 * cache["hit_ratio"]
-    expires = number(cache.get("expires_at"))
+    expires = epoch_s(cache.get("expires_at"))
     cold = cache.get("warm") is False and bool(cache.get("caching_observed"))
     if expires is None and not cold:
-        expires = number(recent.get("expires_at"))
+        expires = epoch_s(recent.get("expires_at"))
     return hit, expires, cold
 
 
@@ -280,12 +289,30 @@ def fit(segments: list, limit: int | None) -> str:
     return line()
 
 
-def columns(environ=os.environ) -> int | None:
+def tty_columns() -> int | None:
+    """Width of the controlling terminal, for when Claude Code passes no COLUMNS."""
+    try:
+        fd = os.open("/dev/tty", os.O_RDONLY | getattr(os, "O_NOCTTY", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        return os.get_terminal_size(fd).columns or None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def columns(environ=os.environ, probe=tty_columns) -> int:
+    """Usable width: COLUMNS (the docs say Claude Code sets it on every run), else the
+    terminal's size, else DEFAULT_COLUMNS; minus the edge Claude Code keeps."""
     try:
         value = int(environ.get("COLUMNS", ""))
     except ValueError:
-        return None
-    return max(10, value - EDGE_COLUMNS) if value > 0 else None
+        value = 0
+    if value <= 0:
+        value = probe() or DEFAULT_COLUMNS
+    return max(10, value - EDGE_COLUMNS)
 
 
 def build(payload: dict, facts: dict, git: dict | None, waiting: list, now: float,
@@ -312,6 +339,7 @@ def gather(payload: dict, now: float, environ=os.environ) -> tuple[dict, dict | 
     five = section(section(payload, "rate_limits"), "five_hour")
     if five:
         safe(data.maybe_alert, five, directory, environ)
+    safe(data.write_context_bridge, payload, environ)
     if directory:
         safe(data.prune_state, directory)
     return facts, git, waiting

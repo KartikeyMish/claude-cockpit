@@ -130,6 +130,19 @@ class RenderTests(unittest.TestCase):
         session_ratio = plain(sl.build(payload(), {}, None, [], NOW))[1]
         self.assertIn("cache 50% ⏱4m", session_ratio, "session-wide hit ratio when no transcript")
 
+    def test_millisecond_timestamps_are_read_as_seconds(self):
+        ms = payload(rate_limits={"five_hour": {"used_percentage": 54, "resets_at": (NOW + 3600) * 1000}},
+                     prompt_cache={"warm": True, "caching_observed": True, "expires_at": (NOW + 240) * 1000})
+        line = plain(sl.build(ms, {}, None, [], NOW))[1]
+        self.assertIn("↻1h", line)
+        self.assertIn("⏱4m", line)
+
+    def test_width_comes_from_columns_then_the_terminal_then_a_default(self):
+        self.assertEqual(sl.columns({"COLUMNS": "80"}, probe=lambda: 200), 76)
+        self.assertEqual(sl.columns({}, probe=lambda: 60), 56)
+        self.assertEqual(sl.columns({"COLUMNS": "junk"}, probe=lambda: None), sl.DEFAULT_COLUMNS - 4)
+        self.assertIsInstance(sl.tty_columns() or 0, int)
+
     def test_segment_failure_never_blanks_the_line(self):
         facts = {"agents": {"running": "x"}}   # would raise inside agents_segment
         lines = plain(sl.build(payload(), facts, None, [], NOW))
@@ -211,12 +224,36 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual((out.returncode, out.stderr), (0, ""))
         self.assertEqual(len(out.stdout.splitlines()), 2)
 
+    def test_gsd_context_bridge_follows_the_monitor_hook(self):
+        data = self.fixture(context_window={"used_percentage": 70, "remaining_percentage": 30,
+                                            "total_input_tokens": 140000, "context_window_size": 200000})
+        bridge = Path(self.env["TMPDIR"]) / "claude-ctx-sess-1.json"
+        self.run_ccx(data)
+        self.assertFalse(bridge.exists(), "no GSD monitor installed: nothing written")
+        (self.claude / "hooks").mkdir()
+        (self.claude / "hooks" / "gsd-context-monitor.js").write_text("// consumer\n")
+        self.assertEqual(self.run_ccx(data).returncode, 0)
+        record = json.loads(bridge.read_text())
+        self.assertEqual({k: record[k] for k in ("session_id", "remaining_percentage", "used_pct")},
+                         {"session_id": "sess-1", "remaining_percentage": 30, "used_pct": 70})
+        self.assertLessEqual(abs(record["timestamp"] - time.time()), 5)
+
     def test_narrow_and_single_line(self):
         out = self.run_ccx(self.fixture(), COLUMNS="44")
         for line in out.stdout.splitlines():
             self.assertLessEqual(sl.width(line), 40, line)
         out = self.run_ccx(self.fixture(), COCKPIT_STATUSLINE_LINES="1")
         self.assertEqual(len(out.stdout.splitlines()), 1)
+
+    def test_a_broken_install_still_exits_zero_silently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "bin"
+            shutil.copytree(ROOT / "bin", fake)
+            (Path(tmp) / "lib" / "cockpit").mkdir(parents=True)
+            (Path(tmp) / "lib" / "cockpit" / "__init__.py").write_text("raise RuntimeError('broken')\n")
+            out = subprocess.run([sys.executable, str(fake / "ccx"), "statusline"], input="{}", capture_output=True,
+                                 text=True, env=self.env, timeout=30, check=False)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
 
     def test_garbage_and_empty_input_exit_zero_without_traceback(self):
         for data in ("", "not json", "[1,2]", json.dumps({"transcript_path": "/etc/passwd", "session_id": "../x"})):
