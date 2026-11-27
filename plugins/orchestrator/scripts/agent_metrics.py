@@ -25,11 +25,15 @@ from __future__ import annotations
 import json
 import os
 import re
+import zlib
 from collections import namedtuple
 from datetime import datetime
 from pathlib import Path
 
-STATE_VERSION = 1
+STATE_VERSION = 2                    # 2: edited paths stored as short hashes, offsets carry the inode
+STATE_MAX_AGE_S = 7 * 86400          # session state files untouched this long are deleted
+TMP_MAX_AGE_S = 3600                 # temp files a cancelled render left behind
+PRUNE_EVERY_S = 86400
 READ_BUDGET = 4 * 1024 * 1024        # bytes read per render, across all agents
 LONG_LINE = 4 * 1024 * 1024          # a longer line (a giant tool result) is skipped unread
 MISS_RETRY_S = 30                    # how often to look again for a task id that has no transcript
@@ -38,11 +42,11 @@ BLOCK = 1024 * 1024
 STALL_SECONDS = 300                  # as cockpit.team.STALL_SECONDS
 RECENT_RESPONSES = 8                 # message ids remembered (a response's records are adjacent)
 EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
-MAX_EDITED = 500
+MAX_EDITED = 500                     # distinct edited files remembered per agent (8-hex-digit hashes)
 WORKTREE_MARK = "/.claude/worktrees/"
 DONE_STATUSES = frozenset({"completed", "failed", "killed"})
 QUIET_STATUSES = frozenset({"idle", "waiting", "pending"})   # not working, so never "stalled"
-SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")   # always used with fullmatch
 ASSISTANT_RE = re.compile(rb'"type":\s*"assistant"')
 TIMESTAMP_RE = re.compile(rb'"timestamp":\s*"([^"]+)"')
 CWD_RE = re.compile(rb'"cwd":\s*"((?:[^"\\]|\\.)*)"')
@@ -59,21 +63,54 @@ Metrics = namedtuple("Metrics", "rows totals")   # rows: task id -> AgentStats; 
 
 # ---------------------------------------------------------------- state
 
-def state_dir() -> Path:
+def state_dir() -> Path | None:
+    """$TMPDIR/claude-cockpit-<uid>/subagent-status, or None when it isn't safely ours (no caching then)."""
     uid = getattr(os, "getuid", lambda: 0)()
     base = os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp"
-    return Path(base) / f"claude-cockpit-{uid}" / "subagent-status"
-
-
-def _private_dir(path: Path) -> bool:
-    """Create PATH (0700) and accept it only if it is a real dir this user owns."""
+    root = Path(base) / f"claude-cockpit-{uid}"
+    path = root / "subagent-status"
     try:
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return path if _ours(root) and _ours(path) else None
+
+
+def _ours(path: Path) -> bool:
+    """PATH is a real directory (not a symlink) owned by this user; tightened to 0700."""
+    try:
         info = os.lstat(path)
     except OSError:
         return False
-    owner_ok = not hasattr(os, "getuid") or info.st_uid == os.getuid()
-    return owner_ok and not os.path.islink(path) and path.is_dir()
+    if os.path.islink(path) or not os.path.isdir(path):
+        return False
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        return False   # someone else's directory in a shared /tmp
+    try:
+        if info.st_mode & 0o077:
+            os.chmod(path, 0o700)
+    except OSError:
+        return False
+    return True
+
+
+def prune_state(directory: Path, now: float) -> None:
+    """At most once a day: delete state files older than STATE_MAX_AGE_S and stale temp files."""
+    stamp = directory / ".pruned"
+    try:
+        if stamp.exists() and now - stamp.stat().st_mtime < PRUNE_EVERY_S:
+            return
+        stamp.touch()
+        with os.scandir(directory) as listing:
+            for item in listing:
+                name = item.name
+                limit = TMP_MAX_AGE_S if name.startswith(".") and name.endswith(".tmp") else (
+                    STATE_MAX_AGE_S if name.endswith(".json") else None)
+                if limit is not None and item.is_file(follow_symlinks=False) and \
+                        now - item.stat(follow_symlinks=False).st_mtime > limit:
+                    os.unlink(item.path)
+    except OSError:
+        return
 
 
 def load_state(path: Path) -> dict:
@@ -87,9 +124,7 @@ def load_state(path: Path) -> dict:
 
 
 def save_state(path: Path, state: dict) -> None:
-    """Write atomically (temp file + rename) into the private state dir; failures are ignored."""
-    if not _private_dir(path.parent):
-        return
+    """Write atomically (temp file + rename) into the state dir; failures are ignored."""
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -116,7 +151,7 @@ def find_session_dir(payload: dict) -> Path | None:
     if isinstance(transcript, str) and transcript.endswith(".jsonl"):
         return Path(transcript[: -len(".jsonl")])
     session_id = payload.get("session_id")
-    if isinstance(session_id, str) and SAFE_ID.match(session_id):
+    if isinstance(session_id, str) and SAFE_ID.fullmatch(session_id):
         matches = sorted(projects_dir().glob(f"*/{session_id}.jsonl"))
         if matches:
             return matches[0].with_suffix("")
@@ -125,7 +160,7 @@ def find_session_dir(payload: dict) -> Path | None:
 
 def agent_file(session_dir: Path, agent_id: str) -> Path | None:
     """agent-<id>.jsonl in this session, or in a sibling session of the same project (resumes)."""
-    if not SAFE_ID.match(agent_id):
+    if not SAFE_ID.fullmatch(agent_id):
         return None
     own = session_dir / "subagents" / f"agent-{agent_id}.jsonl"
     if own.is_file():
@@ -137,7 +172,7 @@ def agent_file(session_dir: Path, agent_id: str) -> Path | None:
 # ---------------------------------------------------------------- incremental reading
 
 def new_entry() -> dict:
-    return {"off": 0, "cost": 0.0, "priced": False, "known": True, "partial": False, "tools": 0,
+    return {"off": 0, "ino": 0, "cost": 0.0, "priced": False, "known": True, "partial": False, "tools": 0,
             "edited": [], "cwd": "", "start": None, "last": None, "model": "", "resp": {}, "path": ""}
 
 
@@ -223,9 +258,10 @@ def feed_line(entry: dict, line: bytes) -> None:
         entry["tools"] += 1
         data = block.get("input") if isinstance(block.get("input"), dict) else {}
         path = data.get("file_path") or data.get("notebook_path")
-        if block.get("name") in EDIT_TOOLS and isinstance(path, str) and path not in entry["edited"]:
-            if len(entry["edited"]) < MAX_EDITED:
-                entry["edited"].append(path)
+        if block.get("name") in EDIT_TOOLS and isinstance(path, str) and len(entry["edited"]) < MAX_EDITED:
+            digest = format(zlib.crc32(path.encode("utf-8", "replace")), "08x")   # the count needs no path
+            if digest not in entry["edited"]:
+                entry["edited"].append(digest)
 
 
 def _skip_long_line(handle, offset: int, size: int) -> int:
@@ -246,12 +282,14 @@ def _skip_long_line(handle, offset: int, size: int) -> int:
 def refresh(entry: dict, path: Path, budget: int) -> int:
     """Read what was appended to PATH since entry['off'], up to BUDGET bytes. Returns bytes used."""
     try:
-        size = path.stat().st_size
+        info = path.stat()
     except OSError:
         return 0
-    if size < entry["off"]:                      # rewritten: start over
+    size = info.st_size
+    if size < entry["off"] or (entry["ino"] and entry["ino"] != info.st_ino):   # rewritten or replaced
         entry.clear()
         entry.update(new_entry())
+    entry["ino"] = info.st_ino
     start = entry["off"]
     if start == 0 and size > FIRST_READ_MAX:
         start, entry["partial"] = size - FIRST_READ_MAX, True
@@ -378,7 +416,7 @@ def _session_agents(session_dir: Path) -> dict:
         with os.scandir(session_dir / "subagents") as listing:
             for item in listing:
                 name = item.name
-                if name.startswith("agent-") and name.endswith(".jsonl") and SAFE_ID.match(name[6:-6]):
+                if name.startswith("agent-") and name.endswith(".jsonl") and SAFE_ID.fullmatch(name[6:-6]):
                     found[name[6:-6]] = Path(item.path)
     except OSError:
         pass
@@ -391,18 +429,24 @@ def collect(payload: dict, now: float, state_path: Path | None = None) -> Metric
     if session_dir is None:
         return None
     key = payload.get("session_id") if isinstance(payload.get("session_id"), str) else session_dir.name
-    if state_path is None and SAFE_ID.match(key or ""):
-        state_path = state_dir() / f"{key}.json"
-    state = load_state(state_path) if state_path else {}
+    if state_path is None and SAFE_ID.fullmatch(key or ""):
+        folder = state_dir()
+        if folder is not None:
+            prune_state(folder, now)
+            state_path = folder / f"{key}.json"
+    loaded = load_state(state_path) if state_path else {}
+    state = loaded
     if state.get("dir") != str(session_dir):
         state = {"v": STATE_VERSION, "dir": str(session_dir), "agents": {}, "metas": {}}
     tasks = {str(t["id"]): t for t in payload.get("tasks") or []
-             if isinstance(t, dict) and isinstance(t.get("id"), str) and SAFE_ID.match(t["id"])}
+             if isinstance(t, dict) and isinstance(t.get("id"), str) and SAFE_ID.fullmatch(t["id"])}
     paths = _session_agents(session_dir)
     old_misses = state.get("misses") if isinstance(state.get("misses"), dict) else {}
     misses = {}
     for tid in tasks:
         cached = cached_entry(state["agents"].get(tid))["path"]
+        if not cached.startswith(str(session_dir.parent) + os.sep):
+            cached = ""                            # only ever read transcripts of this project
         found = paths.get(tid) or (Path(cached) if cached else None)
         tried = old_misses.get(tid)
         if found is None and isinstance(tried, (int, float)) and now - tried < MISS_RETRY_S:
@@ -417,7 +461,10 @@ def collect(payload: dict, now: float, state_path: Path | None = None) -> Metric
     budget = READ_BUDGET
     for aid in sorted(paths, key=lambda a: a not in tasks):     # visible rows first
         agents[aid]["path"] = str(paths[aid])
-        budget -= refresh(agents[aid], paths[aid], budget)
+        try:
+            budget -= refresh(agents[aid], paths[aid], budget)
+        except OSError:                            # unreadable right now: keep its cached totals
+            continue
     old_metas = state.get("metas") if isinstance(state.get("metas"), dict) else {}
     metas = {aid: dict(old_metas[aid]) if isinstance(old_metas.get(aid), dict) else {} for aid in paths}
     for aid in paths:
@@ -426,7 +473,7 @@ def collect(payload: dict, now: float, state_path: Path | None = None) -> Metric
     rows = {tid: row_stats(agents[tid], tasks[tid], paths[tid], metas[tid], payload.get("cwd"), now)
             for tid in tasks if tid in agents}
     totals = session_totals(agents, tasks, finished, now) if agents else None
-    if state_path is not None:
-        save_state(state_path, {"v": STATE_VERSION, "dir": str(session_dir), "agents": agents, "metas": metas,
-                                "misses": misses})
+    new_state = {"v": STATE_VERSION, "dir": str(session_dir), "agents": agents, "metas": metas, "misses": misses}
+    if state_path is not None and new_state != loaded:   # nothing read and nothing new: skip the write
+        save_state(state_path, new_state)
     return Metrics(rows=rows, totals=totals)

@@ -17,6 +17,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "plugins" / "orchestrator" / "scripts"
@@ -331,6 +332,93 @@ class IncrementalReadTests(unittest.TestCase):
             folder = fx.tmp / "tmp" / f"claude-cockpit-{os.getuid()}" / "subagent-status"
             self.assertEqual(folder.stat().st_mode & 0o777, 0o700)
             self.assertEqual((folder / f"{SESSION}.json").stat().st_mode & 0o077, 0)
+
+
+    def test_state_dir_refuses_a_symlinked_or_loose_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / f"claude-cockpit-{os.getuid()}"
+            (base / "elsewhere").mkdir()
+            root.symlink_to(base / "elsewhere")
+            with mock.patch.dict(os.environ, {"TMPDIR": tmp}):
+                self.assertIsNone(agent_metrics.state_dir(), "a symlinked root may be someone else's")
+                root.unlink()
+                root.mkdir(mode=0o777)
+                os.chmod(root, 0o777)
+                folder = agent_metrics.state_dir()
+            self.assertEqual(folder, root / "subagent-status")
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700, "the root is tightened to 0700")
+
+    def test_state_dir_refuses_a_foreign_owner(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"TMPDIR": tmp}), \
+                mock.patch.object(agent_metrics.os, "getuid", return_value=os.getuid() + 1):
+            Path(tmp, f"claude-cockpit-{os.getuid() + 1}").mkdir(mode=0o700)   # ours on disk, "theirs" by uid
+            self.assertIsNone(agent_metrics.state_dir())
+
+    def test_unchanged_transcripts_skip_the_state_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            fx.agent("a1", [assistant("m1", 100, 10)])
+            state, now = fx.tmp / "state.json", time.time()
+            agent_metrics.collect(fx.payload([task("a1")]), now, state)
+            os.utime(state, (1, 1))
+            agent_metrics.collect(fx.payload([task("a1")]), now + 1, state)
+            self.assertEqual(state.stat().st_mtime, 1, "nothing new was read")
+            fx.agent("a1", [assistant("m2", 100, 5)])
+            agent_metrics.collect(fx.payload([task("a1")]), now + 2, state)
+            self.assertNotEqual(state.stat().st_mtime, 1)
+
+    def test_state_keeps_hashes_not_edited_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            fx.agent("a1", [assistant("m1", 100, 10, edits("/repo/secret-name.py", "/repo/other.py"))])
+            state = fx.tmp / "state.json"
+            stats = agent_metrics.collect(fx.payload([task("a1")]), time.time(), state).rows["a1"]
+            self.assertEqual(stats.edits, 2)
+            text = state.read_text()
+            self.assertNotIn("secret-name", text)
+            self.assertEqual(len(json.loads(text)["agents"]["a1"]["edited"][0]), 8)
+
+    def test_old_state_and_stale_temp_files_are_pruned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder, now = Path(tmp), time.time()
+            files = {"old.json": 8 * 86400, "new.json": 86400, ".new.json.1.tmp": 7200, ".x.json.2.tmp": 60}
+            for name, age in files.items():
+                (folder / name).write_text("{}")
+                os.utime(folder / name, (now - age, now - age))
+            agent_metrics.prune_state(folder, now)
+            self.assertEqual(sorted(p.name for p in folder.iterdir()), [".pruned", ".x.json.2.tmp", "new.json"])
+            (folder / "old2.json").write_text("{}")
+            os.utime(folder / "old2.json", (1, 1))
+            agent_metrics.prune_state(folder, now + 60)
+            self.assertTrue((folder / "old2.json").exists(), "pruning runs at most once a day")
+
+    def test_one_unreadable_transcript_keeps_the_others(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            fx.agent("good", [assistant("m1", 100, 10, [("Bash", {"command": "ls"})])])
+            (fx.session / "subagents" / "agent-bad.jsonl").mkdir()     # stat works, open fails
+            rows, order = fx.run(fx.payload([task("bad"), task("good")]))
+            self.assertEqual(order, ["bad", "good"])
+            self.assertIn("🔧1", rows["good"])
+
+    def test_replaced_transcript_is_read_again_from_the_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = Fixture(tmp)
+            first = [assistant(f"m{i}", 10, 9, [("Bash", {"command": "ls"})]) for i in range(3)]
+            path = fx.agent("a1", first)
+            state, now = fx.tmp / "state.json", time.time()
+            self.assertEqual(agent_metrics.collect(fx.payload([task("a1")]), now, state).rows["a1"].tools, 3)
+            fresh = fx.tmp / "fresh.jsonl"            # larger, so only the inode shows it is a new file
+            replacement = [assistant(f"n{i}", 10, 9, cwd="/repo/" + "d" * 200) for i in range(3)]
+            fresh.write_text("".join(json.dumps(r) + "\n" for r in replacement + [
+                assistant("n9", 10, 1, [("Bash", {"command": "ls"})])]))
+            os.replace(fresh, path)
+            self.assertEqual(agent_metrics.collect(fx.payload([task("a1")]), now + 1, state).rows["a1"].tools, 1)
+
+    def test_ids_with_a_trailing_newline_are_rejected(self):
+        self.assertIsNone(agent_metrics.agent_file(Path("/nonexistent"), "a1\n"))
+        self.assertIsNone(agent_metrics.SAFE_ID.fullmatch("a1\n"))
 
 
 class ReaderUnitTests(unittest.TestCase):
