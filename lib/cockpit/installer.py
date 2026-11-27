@@ -8,6 +8,9 @@ backed up first as <file>.cockpit-backup-<timestamp>.
 
   marketplace  `claude-cockpit` from KartikeyMish/claude-cockpit#stable (or --source)
   plugin       orchestrator@claude-cockpit installed or updated at user scope, enabled
+  status line  `statusLine` in Claude's user settings runs `ccx statusline`, unless
+               you have your own (kept; --statusline replaces it). See
+               statusline_setup.py.
   Ghostty      profile copied to <config>/ghostty/cockpit.conf and included from
                <config>/ghostty/config. It is a copy, never a link, because
                Homebrew deletes the old versioned folder on every upgrade.
@@ -50,12 +53,15 @@ GITHUB_SHORTHAND = re.compile(r"([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9._-]+)(?:#
 SOURCE_KEYS = ("source", "repo", "ref", "path", "url")
 CLAUDE_TIMEOUT_S = 300  # adding a marketplace clones its repository
 USAGE = """\
-usage: ccx setup [--source SOURCE] [--no-plugin] [--no-ghostty]
+usage: ccx setup [--source SOURCE] [--no-plugin] [--no-ghostty] [--statusline | --no-statusline]
 
   --source SOURCE  marketplace source (default: KartikeyMish/claude-cockpit#stable);
                    a path registers a local checkout, for development
   --no-plugin      skip the Claude Code marketplace and plugin
-  --no-ghostty     skip the Ghostty profile"""
+  --no-ghostty     skip the Ghostty profile
+  --statusline     use the cockpit status line even if you have another one
+                   (settings.json is backed up first)
+  --no-statusline  leave Claude's statusLine setting alone"""
 
 
 # ---------------------------------------------------------------- options
@@ -65,6 +71,8 @@ class Options:
     source: str = STABLE_SOURCE
     plugin: bool = True
     ghostty: bool = True
+    statusline: bool = True
+    force_statusline: bool = False
 
 
 def is_path_source(source: str) -> bool:
@@ -85,11 +93,16 @@ def normalize_source(source: str) -> str:
 
 def parse_args(args: Sequence[str]) -> Options:
     source, plugin, ghostty = STABLE_SOURCE, True, True
+    statusline, force_statusline = True, False
     rest = list(args)
     while rest:
         arg = rest.pop(0)
         if arg == "--no-plugin":
             plugin = False
+        elif arg == "--statusline":
+            force_statusline = True
+        elif arg == "--no-statusline":
+            statusline = False
         elif arg == "--no-ghostty":
             ghostty = False
         elif arg == "--source":
@@ -98,7 +111,10 @@ def parse_args(args: Sequence[str]) -> Options:
             source = arg.split("=", 1)[1]
         else:
             raise CockpitError(f"ccx setup: unknown option {arg!r}\n{USAGE}")
-    return Options(source=normalize_source(source), plugin=plugin, ghostty=ghostty)
+    if force_statusline and not statusline:
+        raise CockpitError(f"ccx setup: --statusline and --no-statusline contradict each other\n{USAGE}")
+    return Options(source=normalize_source(source), plugin=plugin, ghostty=ghostty,
+                   statusline=statusline, force_statusline=force_statusline)
 
 
 # ---------------------------------------------------------------- sources
@@ -402,6 +418,13 @@ def setup(options: Options, report: Report, stamp: str) -> None:
         report.ok(f"claude {claude.version()}")
         ensure_marketplace(claude, options.source, CLAUDE_HOME / "settings.json", stamp, report)
         ensure_plugin(claude, report)
+    if options.statusline:
+        report.say("Status line")
+        from .statusline_setup import ensure_statusline  # imports this module: load lazily
+        try:
+            ensure_statusline(CLAUDE_HOME / "settings.json", options.force_statusline, stamp, report)
+        except CockpitError as exc:
+            report.warn(f"status line not changed: {exc}")
     if options.ghostty:
         report.say("Ghostty profile")
         directory = ghostty_dir()

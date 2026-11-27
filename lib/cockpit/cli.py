@@ -15,9 +15,11 @@
                            resumable with `claude --resume`
   ccx doctor [--json]      check the cockpit setup end to end, incl. sessions that
                            still run old plugin hooks (⟳) and how to restart them
-  ccx setup [--source SRC] [--no-plugin] [--no-ghostty]
+  ccx setup [--source SRC] [--no-plugin] [--no-ghostty] [--statusline | --no-statusline]
                            install or update the Claude Code plugin (release
-                           channel) and the Ghostty profile; safe to re-run
+                           channel), the status line and the Ghostty profile;
+                           safe to re-run
+  ccx statusline           Claude Code status line (reads its JSON on stdin)
   ccx version | --version
 """
 
@@ -382,6 +384,11 @@ def tier_overrides(environ: dict[str, str], settings: dict[str, str]) -> list[st
             for name in OVERRIDE_VARS if environ.get(name) or settings.get(name)]
 
 
+def cmd_statusline(args: list[str]) -> int:
+    from .statusline import main as statusline_main  # bin/ccx normally reaches it without this module
+    return statusline_main(args)
+
+
 def cmd_doctor(args: list[str]) -> int:
     from .doctor_cmd import cmd_doctor as run_doctor  # imports cli: load lazily
     return run_doctor(args)
@@ -424,6 +431,7 @@ def cmd_team(args: list[str]) -> int:
 COMMANDS = {
     "ls": cmd_ls, "mem": cmd_mem, "gc": cmd_gc, "doctor": cmd_doctor, "wt": cmd_worktree,
     "run": cmd_launch, "ui": cmd_dashboard, "team": cmd_team, "setup": run_setup, "savings": cmd_savings,
+    "statusline": cmd_statusline,
 }
 
 

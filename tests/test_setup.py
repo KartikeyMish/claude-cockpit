@@ -155,7 +155,7 @@ class SetupFlowTests(unittest.TestCase):
         self.box.write_state(markets={"claude-cockpit": {"source": "directory", "path": clone}},
                              plugins={"orchestrator@claude-cockpit": {"version": "1.4.0", "scope": "user",
                                                                       "enabled": False}})
-        out = self.run_ok("--no-ghostty")
+        out = self.run_ok("--no-ghostty", "--no-statusline")   # one rewrite, one backup
         settings = json.loads(self.box.settings_path.read_text())
         entry = settings["extraKnownMarketplaces"]["claude-cockpit"]
         self.assertEqual(entry["source"], {"source": "github", "repo": "KartikeyMish/claude-cockpit",

@@ -18,6 +18,11 @@ if sys.version_info < MIN_PYTHON:
 # Resolve through the ~/.local/bin or Homebrew symlink to find the bundled lib/.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
 
+if __name__ == "__main__" and sys.argv[1:2] == ["statusline"]:
+    # Claude Code runs this on every status line refresh: skip the CLI's imports.
+    from cockpit.statusline import main as statusline_main  # noqa: E402
+    sys.exit(statusline_main(sys.argv[2:]))
+
 from cockpit.cli import main  # noqa: E402
 
 if __name__ == "__main__":
