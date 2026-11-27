@@ -4,6 +4,8 @@ All notable changes to claude-cockpit. The `orchestrator` plugin, `ccx` and the 
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-27
+
 ### Status line
 - **New `ccx statusline`.** Row 1: model and effort, folder and git (branch, uncommitted files, ahead/behind), a context bar with tokens, session cost, duration and lines changed. Row 2: 5-hour usage with a reset countdown, 7-day usage, prompt cache hit rate with a countdown to expiry (`cold` once expired), this session's agents (running, done, stalled, cost), and other sessions waiting for you. Missing data leaves a part out. On narrow terminals the least important parts are shortened, then dropped, before the rest. `COCKPIT_STATUSLINE_LINES=1` keeps it to one row, and `COCKPIT_STATUSLINE_DEBUG=1` prints errors to stderr (shown by `claude --debug`).
 - **Usage alert.** A macOS notification once per 5-hour window when usage reaches 60% (`COCKPIT_USAGE_ALERT_PCT`; `0` turns it off).
