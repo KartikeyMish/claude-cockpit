@@ -4,6 +4,18 @@ All notable changes to claude-cockpit. The `orchestrator` plugin, `ccx` and the 
 
 ## [Unreleased]
 
+### Status line
+- **New `ccx statusline`.** Row 1: model and effort, folder and git (branch, uncommitted files, ahead/behind), a context bar with tokens, session cost, duration and lines changed. Row 2: 5-hour usage with a reset countdown, 7-day usage, prompt cache hit rate with a countdown to expiry (`cold` once expired), this session's agents (running, done, stalled, cost), and other sessions waiting for you. Missing data leaves a part out. On narrow terminals the least important parts are shortened, then dropped, before the rest. `COCKPIT_STATUSLINE_LINES=1` keeps it to one row, and `COCKPIT_STATUSLINE_DEBUG=1` prints errors to stderr (shown by `claude --debug`).
+- **Usage alert.** A macOS notification once per 5-hour window when usage reaches 60% (`COCKPIT_USAGE_ALERT_PCT`; `0` turns it off).
+- **`ccx setup` installs it** when there's no status line or cockpit's is already set, refreshing every 15s. Your own status line is kept; `ccx setup --statusline` replaces it after backing up settings.json, and `--no-statusline` skips the step.
+- **GSD context monitor.** When `gsd-context-monitor.js` is installed, `ccx statusline` keeps writing its context bridge file.
+- **Doctor and uninstall.** `ccx doctor` checks the status line command (installed, and pointing at a ccx that still exists); `uninstall.sh` removes a cockpit-owned status line after a backup and keeps your own.
+- **Bounded reads.** Transcripts are read incrementally in bounded chunks, with offsets cached under `$TMPDIR/claude-cockpit-<uid>/`.
+
+### Agent rows
+- **New columns.** Subagent rows show each agent's API-equivalent cost, tool calls (🔧), files edited (✎), `⎇wt` for an agent in its own worktree, and a red `stalled` for a running agent after 5 minutes without transcript writes. The last row carries session totals (running, done, agent cost, peak parallel), because Claude Code keys rows by task id and drops extra lines. Narrow rows drop the totals first, then the new columns, before the label is cut.
+- **Note:** Claude Code marks `subagentStatusLine` as deprecated in favour of mods; it still runs on 2.1.332.
+
 ## [1.6.0] - 2026-11-10
 
 ### Routing policy v1.6

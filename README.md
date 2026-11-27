@@ -78,7 +78,7 @@ git clone https://github.com/KartikeyMish/claude-cockpit ~/claude-cockpit && cd 
 ./install.sh --local         # development: use this checkout as the plugin source
 ```
 
-`ccx` runs straight from the checkout, so check out a release tag (`git checkout v1.5.0`) to match the plugin from `#stable`, or use `--local` to run both from the checkout. `install.sh` runs `ccx setup` for the plugin and profile, so both install paths share one implementation.
+`ccx` runs straight from the checkout, so check out a release tag (`git checkout v1.7.0`) to match the plugin from `#stable`, or use `--local` to run both from the checkout. `install.sh` runs `ccx setup` for the plugin and profile, so both install paths share one implementation.
 
 ### For a whole team
 
@@ -102,6 +102,8 @@ Commit this to a project's `.claude/settings.json`. Everyone who trusts the fold
 | Homebrew | `brew upgrade --cask claude-cockpit`, then `ccx setup` (run them as two commands; see [Troubleshooting](#troubleshooting)) |
 | Plugin only | `claude plugin marketplace update claude-cockpit`, then `claude plugin update orchestrator@claude-cockpit` |
 | Source | `git pull` (or check out the new tag), then `./install.sh` |
+
+Updating to 1.7 adds the cockpit status line unless you already have one of your own. To switch to it, run `ccx setup --statusline` once (settings.json is backed up first).
 
 After updating the plugin, restart running sessions (`ccx doctor` shows which). Claude Code reads a plugin's hook list once, when the process starts; `/clear` and compaction keep the old one. For a local checkout install, hook scripts are live and only hooks.json changes need a restart; for marketplace installs, any plugin update needs a restart. To restart a session, `exit`, then run `claude --resume <id>` in that directory. The dashboard and `ccx ls` mark those sessions with `⟳`.
 
@@ -211,10 +213,28 @@ Just type **`ccx`**. The cockpit opens; press `⏎` to start Claude in the curre
 `ccx` passes any other arguments straight to `claude` (`ccx --model sonnet`, `ccx -c`). Use `ccx run …` if your prompt starts with a ccx word such as `ls`.
 
 **Inside Claude:** while agents work, the panel under the prompt shows rows like
-`⠼ ◆ senior-engineer  opus·high  ▃▅▅█▆ 18.2k  9% ctx  1:42  Writing migration 002_add_status.sql`.
+`⠼ ◆ senior-engineer  opus·high  ▃▅▅█▆ 18.2k  9% ctx  1:42  $0.42  🔧23  ✎4  ⎇wt  Writing migration 002_add_status.sql`.
+After the elapsed time come the agent's API-equivalent cost, tool calls (🔧), files edited (✎), `⎇wt` when it works in its own worktree, and a red `stalled` when a running agent hasn't written to its transcript for 5 minutes; a missing field is simply left out. The last row ends with session totals (running, done, agent cost, peak parallel). On narrow rows the totals go first, then these columns, before the label is cut.
 For matching colours everywhere, run `/theme` and pick **Cockpit**.
 
 **Ghostty keys:** `Cmd+D` / `Cmd+Shift+D` split · `Cmd+Opt+arrows` move between splits · `Cmd+Shift+Enter` zoom a split · `Ctrl+`` ` drop-down terminal from anywhere · `Shift+Enter` newline in Claude · Option shortcuts (`Opt+P` model picker) work.
+
+### Status line
+
+`ccx setup` points Claude Code's status line at `ccx statusline`, unless you already have one of your own. To switch to it, run `ccx setup --statusline` (settings.json is backed up first). Two rows:
+
+```
+Opus 5.5·high │ my-repo ⎇ main ●3 ↑1 │ ▓▓▓░░░░░░░ 32% 64k/200k │ $4.12 · 38m · +212 −40
+5h ▓▓▓░░░ 54% ↻2h10m · 7d 31% │ cache 92% ⏱4m │ agents 1▶ 3✓ $1.80 │ ⚠ 2 sessions waiting
+```
+
+The first row has the model and effort, the folder and git state (branch, uncommitted files, ahead/behind), context use and the session's cost, duration and lines changed. The second has 5-hour usage with its reset countdown, 7-day usage, the prompt cache hit rate with a countdown to expiry (`cold` once it has expired), this session's agents, and other sessions waiting for you. Missing data just leaves a part out, and on a narrow terminal the least important parts shrink, then go, before the rest.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COCKPIT_USAGE_ALERT_PCT` | `60` | macOS notification, once per 5-hour window, when 5-hour usage reaches this; `0` turns it off |
+| `COCKPIT_STATUSLINE_LINES=1` | two rows | Everything on one row |
+| `COCKPIT_STATUSLINE_DEBUG=1` | off | Errors to stderr, shown by `claude --debug` |
 
 ### Steering the routing
 
